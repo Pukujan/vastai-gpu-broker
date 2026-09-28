@@ -4,7 +4,7 @@
 
 Updated: 2026-09-28. Contract target: SPEC/PDD/SDD/TDD version 1; implementation schema is pending.
 
-Source authority: `https://github.com/Pukujan/vastai-gpu-broker` (visibility verified public). Working branch: `feature/research-first-ephemeral-router`. PR #5 is open as a draft; its current remote head before the local guardian and volume-cleanup changes is `a95b6f7`. Issue #4 records the two-guardian owner requirement. The branch is not merged; this checkpoint does not claim a release.
+Source authority: `https://github.com/Pukujan/vastai-gpu-broker` (visibility verified public). Working branch: `feature/research-first-ephemeral-router`. PR #5 is open as a draft at `bf0c2d3`, including the guardian interface and verified volume cleanup. Issue #4 records the two-guardian owner requirement. The branch is not merged; this checkpoint does not claim a release.
 
 ## Content system pin
 
@@ -17,7 +17,7 @@ Canonical task: [VBR-0001 / issue #1](https://github.com/Pukujan/vastai-gpu-brok
 
 ## Actual capability
 
-- The working tree now contains a Python broker package with exact Hugging Face candidate resolution, evidence validation, live Vast offer retrieval/normalization, cost comparison, bounded offer caching, a review/authorization gate, provider adapters, a lease journal/supervisor, and a timestamped snapshot workflow that proposes a PR rather than pushing snapshots to `main`. The current local changes add a fail-closed guardian/registry interface and independent instance/volume cleanup verification; these changes are not yet pushed.
+- The working tree now contains a Python broker package with exact Hugging Face candidate resolution, evidence validation, live Vast offer retrieval/normalization, cost comparison, bounded offer caching, a review/authorization gate, provider adapters, a lease journal/supervisor, and a timestamped snapshot workflow that proposes a PR rather than pushing snapshots to `main`. PR #5 includes a fail-closed guardian/registry interface and independent instance/volume cleanup verification.
 - The supported command path is still read-only (`offers` and `route`); the README correctly says there is no supported end-to-end command that researches, prepares, confirms, creates, installs, probes, and cleans up a real model run.
 - Joint fit for multiple simultaneously resident models and the parallel bid-race coordinator are explicitly blocked with zero creates. These remain required future capabilities for the full user goal, not completed features.
 - The plan and contracts specify complete cost accounting, model evidence, lifecycle cleanup, multi-model fit, and finite aggregate race limits. Unsupported provider units, unknown costs, stale/cached quotes and missing spend limits fail closed.
@@ -38,7 +38,7 @@ Canonical task: [VBR-0001 / issue #1](https://github.com/Pukujan/vastai-gpu-brok
 - At helper revision `c069613ca8b3e02bcf5aba1960160583537f8a3a`, the adopter validator, full CGM adapter validator, and HSW automation check pass.
 - `python -m pytest -q`: 126 tests passed. `python -m compileall -q src tests` and `git diff --check` passed.
 - The pinned CGM adoption, adapter, and HSW contract checks passed; `continuity validate --root .` returned `VALID`. A54–A56 and M46–M47 remain release gates; the local fake-based tests do not establish deployed guardian recovery or real service behavior.
-- GitHub reports `allow_auto_merge=true`. `main` now requires the strict `gates` check and one approving review, dismisses stale reviews, enforces the rule for admins, and blocks force-pushes and branch deletion. PR #5 remains a draft, its `gates` check passes on the previous remote head, `reviewDecision` is `REVIEW_REQUIRED`, and `autoMergeRequest` is null. GitHub rejected `gh pr merge --auto` while the PR is draft.
+- GitHub reports `allow_auto_merge=true`. `main` now requires the strict `gates` check and one approving review, dismisses stale reviews, enforces the rule for admins, and blocks force-pushes and branch deletion. PR #5 remains a draft; `gates` is running on head `bf0c2d3`, `reviewDecision` is `REVIEW_REQUIRED`, and `autoMergeRequest` is null. GitHub rejected `gh pr merge --auto` while the PR is draft.
 - No paid instance was created and no Vast create/search API call or end-to-end model challenge was run in this turn.
 
 ## Blockers and open inputs
