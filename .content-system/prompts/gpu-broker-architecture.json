@@ -1,0 +1,36 @@
+{
+  "record_schema": "vast-broker.asset-source.v1",
+  "asset": "docs/content-system-assets/Vast GPU Broker architecture.png",
+  "role": "architecture helper graphic",
+  "reader_question": "What checks are meant to happen before a temporary GPU lease, and what happens after the work?",
+  "dominant_message": "Model evidence, a current quote, and owner limits precede paid work; cleanup must be verified.",
+  "exact_title": "Planned GPU run path",
+  "exact_subtitle": "Evidence, live prices and owner limits guide every paid step",
+  "method": "Code-rendered diagram using Pillow; no image-generation model was used. The reproducible renderer is scripts/render_content_system_asset.py.",
+  "palette": [
+    "#F6F8FB",
+    "#14253D",
+    "#2868A8",
+    "#258477",
+    "#BD7726"
+  ],
+  "dimensions": "1600x650",
+  "text_policy": "Short functional labels. The planned-state pill and stop condition are part of the diagram's explanation.",
+  "alt_text": "A planned five-stage GPU workflow moves from model research to an offer quote, owner-limit checks, bounded work, and verified cleanup; missing evidence or limits stop the flow before creation.",
+  "placement": "README mechanism section, beside a clear statement of which stages are implemented and which remain planned.",
+  "crop_behavior": "Keep the complete diagram visible at wide, tablet, and narrow sizes; if it cannot be scaled legibly, link to the full image rather than cropping stages.",
+  "rejection_conditions": [
+    "A stage is shown as shipped without matching code and test evidence.",
+    "A crop hides the planned-state marker, any stage, or the stop condition.",
+    "A label implies current availability, guaranteed pricing, or unconditional cleanup."
+  ],
+  "review_decision": "Accepted after direct inspection at the full rendered size; labels are legible, the five stages are distinct, and planned behavior is marked.",
+  "reviewed_at": "2026-09-28",
+  "renderer": {
+    "source": "scripts/render_content_system_asset.py",
+    "library": "Pillow 12.3.0",
+    "output_format": "PNG",
+    "seed": null
+  },
+  "sha256": "07ffed819275626ee992ec764f424e9a1322409212e7f91659f6eb2d6e140cf0"
+}

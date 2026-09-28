@@ -1,0 +1,24 @@
+{
+  "schema_version": "content-generation.adapter.v1",
+  "helper_repository": "https://github.com/Pukujan/content-generation-modules",
+  "helper_version": "0.5.7",
+  "helper_commit": "c069613ca8b3e02bcf5aba1960160583537f8a3a",
+  "modules": [
+    "brand-foundation",
+    "content-context",
+    "writing-direction",
+    "human-sounding-writing",
+    "human-output-naming",
+    "visual-direction",
+    "image-generation",
+    "html-demo"
+  ],
+  "writing_contract": "docs/writing-routing.json::acs_prompt_inject.system_block",
+  "adapter_contract": "content-generation.project-brief.v2",
+  "validation": [
+    "scripts/validate_cgm_adoption.py --helper-root <pinned-checkout>",
+    "<pinned-checkout>/scripts/validate_content_system.py --root <pinned-checkout> --adapter .content-system --project-root .",
+    "<pinned-checkout>/scripts/verify_hsw_applied.py --root <pinned-checkout>"
+  ],
+  "vendored_modules": false
+}

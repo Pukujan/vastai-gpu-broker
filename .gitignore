@@ -4,9 +4,11 @@
 __pycache__/
 *.py[cod]
 .venv/
+.cgm/
 venv/
 .idea/
 .vscode/
 *.log
 .coverage
 htmlcov/
+*.egg-info/

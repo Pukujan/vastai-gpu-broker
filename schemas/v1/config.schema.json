@@ -1,0 +1,98 @@
+{
+  "$id": "https://project-continuity.dev/schema/v1/config.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "canonical": {
+      "additionalProperties": false,
+      "properties": {
+        "current": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "project": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tasks": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "current",
+        "tasks"
+      ],
+      "type": "object"
+    },
+    "profile": {
+      "enum": [
+        "minimal",
+        "software"
+      ],
+      "type": "string"
+    },
+    "protocol": {
+      "const": "project-continuity"
+    },
+    "protocol_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "const": "project-continuity.config.v1"
+    },
+    "schema_dir": {
+      "const": "schemas/v1"
+    },
+    "task_prefix": {
+      "pattern": "^[A-Z][A-Z0-9]*$",
+      "type": "string"
+    },
+    "workspace": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "managed-worktrees",
+            "single-checkout"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "trackers": {
+      "additionalProperties": false,
+      "properties": {
+        "beads": {
+          "type": "boolean"
+        },
+        "github": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "github",
+        "beads"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "protocol",
+    "protocol_version",
+    "profile",
+    "task_prefix",
+    "canonical",
+    "schema_dir",
+    "trackers"
+  ],
+  "title": "Project Continuity Config v1",
+  "type": "object"
+}

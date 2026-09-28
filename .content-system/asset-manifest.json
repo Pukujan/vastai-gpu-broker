@@ -1,0 +1,29 @@
+{
+  "schema_version": "content-generation.asset-manifest.v1",
+  "system_version": "0.5.7",
+  "assets": [
+    {
+      "path": "docs/content-system-assets/Vast GPU Broker architecture.png",
+      "feature": "gpu-broker-architecture",
+      "role": "architecture helper graphic",
+      "orientation": "wide",
+      "dimensions": "1600x650",
+      "text_policy": "Functional labels and an explicit planned-workflow marker; no decorative or provider-interface text.",
+      "exact_title": "Planned GPU run path",
+      "exact_subtitle": "Evidence, live prices and owner limits guide every paid step",
+      "alt_text": "A planned five-stage GPU workflow moves from model research to an offer quote, owner-limit checks, bounded work, and verified cleanup; missing evidence or limits stop the flow before creation.",
+      "usage": "README mechanism section, beside a clear statement of which stages are implemented and which remain planned.",
+      "crop_behavior": "Display the full 1600x650 image; preserve every card, connector, title, and footer.",
+      "rejection_conditions": [
+        "Any stage is presented as shipped without matching code and test evidence.",
+        "The workflow is cropped so the planned-state marker or stop condition disappears.",
+        "A label implies that a quote guarantees availability or that cleanup is unconditional."
+      ],
+      "review_decision": "accepted as a text-labeled, code-rendered architecture helper graphic; not a narrative image",
+      "provider": "Code-rendered with Pillow; no image-generation model",
+      "prompt_record": ".content-system/prompts/gpu-broker-architecture.json",
+      "hash": "07ffed819275626ee992ec764f424e9a1322409212e7f91659f6eb2d6e140cf0",
+      "source_code": "scripts/render_content_system_asset.py"
+    }
+  ]
+}

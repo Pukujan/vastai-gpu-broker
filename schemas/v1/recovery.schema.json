@@ -1,0 +1,36 @@
+{
+  "$id": "https://project-continuity.dev/schema/v1/recovery.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "canonical_root": { "minLength": 1, "type": "string" },
+    "canonical_task": { "minLength": 1, "type": "string" },
+    "checkpoint": { "type": "object" },
+    "commit": { "minLength": 1, "type": "string" },
+    "project_id": { "minLength": 1, "type": "string" },
+    "protocol_version": { "minLength": 1, "type": "string" },
+    "recorded_at": { "minLength": 1, "type": "string" },
+    "reconciled_at": { "minLength": 1, "type": "string" },
+    "ref": { "minLength": 1, "type": "string" },
+    "repository": { "minLength": 1, "type": "string" },
+    "schema": { "const": "project-continuity.recovery.v1" },
+    "status": { "enum": ["pending-reconciliation", "reconciled"], "type": "string" },
+    "task_id": { "pattern": "^[A-Z][A-Z0-9]*-[0-9]{4}$", "type": "string" }
+  },
+  "required": [
+    "schema",
+    "protocol_version",
+    "project_id",
+    "task_id",
+    "canonical_root",
+    "canonical_task",
+    "repository",
+    "ref",
+    "commit",
+    "recorded_at",
+    "status",
+    "checkpoint"
+  ],
+  "title": "Continuity recovery receipt v1",
+  "type": "object"
+}

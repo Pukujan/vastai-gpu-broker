@@ -1,0 +1,55 @@
+{
+  "schema_version": "content-generation.project-brief.v2",
+  "project": "Vast.ai GPU broker",
+  "audience": [
+    "Maintainers and agents comparing short-lived GPU hosting for model work"
+  ],
+  "problem": "A model's deployment requirements, live GPU offers, and the limits on paid use must be considered together. A saved offer list cannot establish current price or availability.",
+  "solution": "Route a model task through exact-artifact research, current marketplace quotes, explicit owner limits, and—when the implementation supports it—a bounded lease with verified cleanup.",
+  "mechanism": [
+    "Resolve the exact model artifact and the evidence for its runtime and resource needs.",
+    "Search current Vast offers and compare requested storage and known network costs.",
+    "Keep unknowns and missing owner limits visible before any paid transition.",
+    "Treat lease creation, supervision, and verified destruction as separate gated lifecycle work."
+  ],
+  "evidence": [
+    {
+      "claim": "At the pinned base revision, the project README describes an offer-refresh-only starting point and explicitly says it does not rent GPUs yet.",
+      "source": "Committed README introduction and Billing boundary at the broker base revision.",
+      "status": "shipped",
+      "supports": "The pinned README states that the offer list is a convenience cache and that create, stop, and destroy commands are absent at that revision.",
+      "limits": "This describes the pinned base revision only. It does not establish current working-tree implementation, live provider behavior, hardware fit, or paid end-to-end readiness.",
+      "recorded_at": "2026-09-28T00:00:00Z",
+      "source_revision": {
+        "kind": "repository_artifact",
+        "reference": "Broker base README",
+        "repository": "Pukujan/vastai-gpu-broker",
+        "commit": "6ab25107c6dca493d08290c3286de1fd852459a6",
+        "path": "README.md",
+        "locator": "Introduction and Billing boundary",
+        "uri": "https://github.com/Pukujan/vastai-gpu-broker/blob/6ab25107c6dca493d08290c3286de1fd852459a6/README.md"
+      },
+      "cite_in_readme": false
+    }
+  ],
+  "boundaries": [
+    "The helper does not supply product facts or grant permission to spend.",
+    "A market snapshot is not a launch-time quote or proof of availability.",
+    "The target workflow is not evidence of a completed paid run or verified teardown.",
+    "Do not claim a global cheapest offer when retrieval is incomplete or truncated.",
+    "Unknown model requirements and missing owner caps stay explicit."
+  ],
+  "terminology": {
+    "preferred": {
+      "current offer data": "live search result or timestamped snapshot, according to its source",
+      "hourly price": "machine-hour price, with storage and network components identified separately",
+      "verified cleanup": "provider listing no longer reports the request-owned instance"
+    },
+    "avoid": [
+      "cheapest in the market",
+      "guaranteed cleanup",
+      "proven fit from a rule of thumb",
+      "free after stop"
+    ]
+  }
+}
