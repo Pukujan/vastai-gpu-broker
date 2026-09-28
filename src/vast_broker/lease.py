@@ -5,21 +5,26 @@ This module never reports a host/network failure as a provider-side deletion gua
 from __future__ import annotations
 
 import math
+import os
 import time
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping, Protocol
 
+from .guardians import GuardianAck, GuardianCapabilities, GuardianReadinessReceipt, LeaseCreateIntent
 from .journal import JournalError, LeaseJournal
 
 
 class LeaseProvider(Protocol):
     def list_instances(self) -> list[dict[str, Any]]: ...
+    def list_volumes(self) -> list[dict[str, Any]]: ...
     def get_instance(self, instance_id: str) -> dict[str, Any] | None: ...
     def create_instance(self, offer_id: int, params: dict[str, Any]) -> dict[str, Any]: ...
     def stop_instance(self, instance_id: str) -> Any: ...
     def destroy_instance(self, instance_id: str) -> Any: ...
+    def destroy_volume(self, volume_id: str) -> Any: ...
     def change_bid(self, instance_id: str, price_usd_per_machine_hour: Decimal | str) -> Any: ...
 
 
@@ -56,6 +61,120 @@ def _instances(value: Any) -> list[dict[str, Any]]:
 def _instance_id(instance: Mapping[str, Any]) -> str | None:
     value = instance.get("id", instance.get("instance_id", instance.get("contract_id", instance.get("new_contract"))))
     return str(value) if value is not None and str(value) else None
+
+
+def _volume_ids(instance: Mapping[str, Any]) -> tuple[str, ...]:
+    """Read explicit volume IDs without treating malformed provider data as empty."""
+    found: list[str] = []
+    for field in ("volume_ids", "volumes", "volume_id", "disk_id"):
+        if field not in instance or instance[field] is None:
+            continue
+        values = instance[field]
+        if isinstance(values, (str, int)) and not isinstance(values, bool):
+            values = [values]
+        elif isinstance(values, Mapping):
+            values = [values]
+        elif not isinstance(values, (list, tuple)):
+            raise LeaseError(f"provider returned malformed {field} ownership data")
+        for item in values:
+            if isinstance(item, Mapping):
+                value = item.get("id", item.get("volume_id", item.get("disk_id")))
+            else:
+                value = item
+            if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
+                raise LeaseError(f"provider returned malformed {field} ownership data")
+            raw = str(value).strip()
+            try:
+                if int(raw) < 1 or str(int(raw)) != raw:
+                    raise ValueError
+            except ValueError:
+                raise LeaseError(f"provider returned malformed {field} ownership data") from None
+            found.append(raw)
+    return tuple(sorted(set(found)))
+
+
+def _volume_instance_ids(volume: Mapping[str, Any]) -> tuple[str, ...]:
+    """Parse the documented volume-to-instance relationship conservatively."""
+    attached = volume.get("instances")
+    if not isinstance(attached, list):
+        raise ValueError("provider volume listing omitted its instance relationships")
+    found: list[str] = []
+    for item in attached:
+        if isinstance(item, Mapping):
+            value = item.get("id", item.get("instance_id", item.get("contract_id")))
+        else:
+            value = item
+        if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
+            raise ValueError("provider volume listing returned a malformed instance relationship")
+        found.append(str(value))
+    return tuple(sorted(set(found)))
+
+
+def _volume_snapshot(value: Any) -> tuple[dict[str, tuple[str, ...]], dict[str, dict[str, Any]]]:
+    if isinstance(value, Mapping):
+        value = value.get("volumes")
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise ValueError("provider volume listing is malformed")
+    attachments: dict[str, tuple[str, ...]] = {}
+    rows: dict[str, dict[str, Any]] = {}
+    for row in value:
+        raw_id = row.get("id")
+        if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id).strip():
+            raise ValueError("provider volume listing omitted a valid ID")
+        volume_id = str(raw_id)
+        try:
+            if int(volume_id) < 1 or str(int(volume_id)) != volume_id:
+                raise ValueError
+        except ValueError:
+            raise ValueError("provider volume listing returned an invalid ID") from None
+        if volume_id in rows:
+            raise ValueError("provider volume listing returned duplicate IDs")
+        attachments[volume_id] = _volume_instance_ids(row)
+        rows[volume_id] = row
+    return attachments, rows
+
+
+def _readiness_matches(receipt: Any, intent: LeaseCreateIntent) -> bool:
+    if not isinstance(receipt, GuardianReadinessReceipt):
+        return False
+    acks = receipt.guardian_acks
+    if not isinstance(acks, tuple) or len(acks) < 2 or any(not isinstance(ack, GuardianAck) for ack in acks):
+        return False
+    guardian_ids = {ack.guardian_id for ack in acks}
+    control_hosts = {ack.control_host_id for ack in acks}
+    failure_domains = {ack.failure_domain_id for ack in acks}
+    declared_domains = receipt.declared_failure_domains
+    return bool(
+        isinstance(receipt.registry_id, str) and receipt.registry_id.strip()
+        and receipt.request_id == intent.request_id
+        and receipt.operation_id == intent.operation_id
+        and receipt.attempt_id == intent.attempt_id
+        and receipt.operation_fence == intent.operation_fence
+        and receipt.intent_digest == intent.digest
+        and receipt.deadline_epoch == intent.deadline_epoch
+        and receipt.physical_separation_proven is False
+        and len(guardian_ids) == len(acks)
+        and len(control_hosts) == len(acks)
+        and len(failure_domains) == len(acks)
+        and intent.initiating_host_id not in control_hosts
+        and isinstance(declared_domains, tuple)
+        and len(declared_domains) == len(acks)
+        and set(declared_domains) == failure_domains
+        and all(
+            isinstance(ack.guardian_id, str) and ack.guardian_id.strip()
+            and isinstance(ack.control_host_id, str) and ack.control_host_id.strip()
+            and isinstance(ack.failure_domain_id, str) and ack.failure_domain_id.strip()
+            and ack.registry_id == receipt.registry_id
+            and ack.request_id == intent.request_id
+            and ack.operation_fence == intent.operation_fence
+            and ack.intent_digest == intent.digest
+            and isinstance(ack.capabilities, GuardianCapabilities)
+            and ack.capabilities.recovery_complete
+            and isinstance(ack.read_revision, int) and not isinstance(ack.read_revision, bool)
+            and ack.read_revision >= 0
+            for ack in acks
+        )
+    )
 
 
 class LeaseSupervisor:
@@ -159,7 +278,8 @@ class LeaseController:
     """Owns create intent, performs work under a bounded lease, and verifies cleanup."""
 
     def __init__(self, provider: LeaseProvider, journal: LeaseJournal, supervisor: Any | None = None,
-                 *, clock: Callable[[], float] = time.time, sleep_fn: Callable[[float], None] = time.sleep,
+                 *, guardian_gate: Any | None = None,
+                 clock: Callable[[], float] = time.time, sleep_fn: Callable[[float], None] = time.sleep,
                  startup_poll_seconds: float = 1.0, cleanup_attempts: int = 3):
         if cleanup_attempts < 1:
             raise ValueError("cleanup_attempts must be at least one")
@@ -169,6 +289,7 @@ class LeaseController:
         self.sleep_fn, self.startup_poll_seconds = sleep_fn, startup_poll_seconds
         self.cleanup_attempts = cleanup_attempts
         self.supervisor = supervisor
+        self.guardian_gate = guardian_gate
 
     def run(self, request_id: str, plan: Mapping[str, Any], operation: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
         """Create one owned lease, run caller work without holding the journal lock, and verify teardown."""
@@ -191,6 +312,11 @@ class LeaseController:
         _duration(plan, "hung_request_timeout_seconds", required=True)
         if "offer_id" not in plan or not isinstance(plan.get("create_params"), Mapping):
             raise LeaseError("plan must include offer_id and an explicit create_params object")
+        if self.guardian_gate is None:
+            raise LeaseError("two remote cleanup paths and a shared registry must be configured before create")
+        initiating_host_id = os.environ.get("VAST_BROKER_CONTROL_HOST_ID", "").strip()
+        if not initiating_host_id:
+            raise LeaseError("VAST_BROKER_CONTROL_HOST_ID must identify the initiating control host before create")
         plan_type = str(plan.get("rental_type", plan.get("type", ""))).lower()
         create_params = dict(plan["create_params"])
         if plan_type in {"bid", "interruptible"}:
@@ -217,8 +343,6 @@ class LeaseController:
             create_params["price"] = str(starting_bid)
         elif create_params.get("price") is not None:
             raise LeaseError("on-demand create cannot include an interruptible bid price")
-        now = self.clock()
-        label = f"vbr-{self.journal._key(request_id)[:16]}-{uuid.uuid4().hex[:8]}"
         policy: dict[str, float] = {"max_runtime_seconds": hard_timeout}
         for field in ("cold_start_timeout_seconds", "idle_timeout_seconds", "hung_request_timeout_seconds", "stop_after_idle_seconds", "retention_seconds", "start_deadline_seconds"):
             val = _duration(plan, field)
@@ -226,6 +350,11 @@ class LeaseController:
                 policy[field] = val
         if ("stop_after_idle_seconds" in policy) != ("retention_seconds" in policy):
             raise LeaseError("stop_after_idle_seconds and retention_seconds must be configured together")
+        attempt_id = uuid.uuid4().hex
+        operation_fence = time.time_ns()
+        label = f"vbr-{self.journal._key(request_id)[:16]}-{attempt_id[:12]}"
+        intent: LeaseCreateIntent | None = None
+        readiness: GuardianReadinessReceipt | None = None
         with self.journal.locked(request_id):
             prior = self.journal.load(request_id)
             if prior:
@@ -233,10 +362,28 @@ class LeaseController:
                 raise LeaseError(detail, prior)
             pre = self._list_required()
             pre_ids = {_instance_id(x) for x in pre}
+            pre_volume_attachments, _ = _volume_snapshot(self._list_volumes_required())
+            pre_volume_ids = set(pre_volume_attachments)
+            now = self.clock()
+            deadline_epoch = now + hard_timeout
+            intent = LeaseCreateIntent(
+                request_id=request_id,
+                operation_id=request_id,
+                attempt_id=attempt_id,
+                attempt_label=label,
+                operation_fence=operation_fence,
+                deadline_epoch=deadline_epoch,
+                initiating_host_id=initiating_host_id,
+                preexisting_instance_ids=tuple(sorted(x for x in pre_ids if x)),
+                preexisting_volume_ids=tuple(sorted(pre_volume_ids)),
+            )
             record = {"schema_version": 1, "request_id": request_id, "label": label,
+                      "attempt_id": attempt_id, "operation_fence": operation_fence,
+                      "initiating_host_id": initiating_host_id,
                       "state": "CREATE_INTENT", "created_at_utc": _utc(now), "created_epoch": now,
-                      "hard_deadline_epoch": now + hard_timeout, "start_deadline_epoch": now + start_timeout, "policy": policy,
+                      "hard_deadline_epoch": deadline_epoch, "start_deadline_epoch": now + start_timeout, "policy": policy,
                       "pre_create_instance_ids": sorted(x for x in pre_ids if x),
+                      "pre_create_volume_ids": sorted(pre_volume_ids),
                       "owned_instance_ids": [], "events": [{"at_utc": _utc(now), "event": "create_intent_persisted"}],
                       "plan": dict(plan)}
             self.journal.save(record)
@@ -251,6 +398,28 @@ class LeaseController:
                     current["failure"] = "supervisor_start_failed"
                     self.journal.save(current)
             raise LeaseError("supervisor failed to start; no create was attempted", current) from exc
+
+        try:
+            readiness = self.guardian_gate.arm_before_create(intent)
+            if not _readiness_matches(readiness, intent):
+                raise ValueError("guardian readiness receipt did not match the durable intent")
+        except Exception as exc:
+            with self.journal.locked(request_id):
+                current = self.journal.load(request_id) or record
+                if current.get("state") == "CREATE_INTENT" and not current.get("owned_instance_ids"):
+                    current["state"] = "FAILED_CLEAN"
+                    current["failure"] = "guardian_readiness_failed"
+                    current["guardian_readiness_error"] = getattr(exc, "reason_code", type(exc).__name__)
+                    self.journal.save(current)
+            raise LeaseError("the shared lease record and two remote cleanup paths could not be verified; no create was attempted", current) from None
+
+        with self.journal.locked(request_id):
+            current = self.journal.load(request_id)
+            if not current or current.get("state") != "CREATE_INTENT":
+                raise LeaseError("lease state changed before create; create was blocked", current or {})
+            current["guardian_readiness_receipt"] = asdict(readiness)
+            current["guardian_ready_at_utc"] = _utc(self.clock())
+            self.journal.save(current)
 
         with self.journal.locked(request_id):
             current = self.journal.load(request_id)
@@ -313,8 +482,71 @@ class LeaseController:
                     if latest and latest.get("state") not in {"DESTROYED", "FAILED_CLEAN"}:
                         latest["state"] = "DESTROY_REQUIRED"
                         self.journal.save(latest)
-                self._cleanup_request(request_id)
+            self._cleanup_request(request_id)
             raise
+
+        try:
+            direct_volume_ids = set(_volume_ids(instance))
+            preexisting_volume_ids = set(intent.preexisting_volume_ids)
+            known_owned_volume_ids = direct_volume_ids - preexisting_volume_ids
+            borrowed_volume_ids = direct_volume_ids & preexisting_volume_ids
+            with self.journal.locked(request_id):
+                current = self.journal.load(request_id)
+                if not current or iid not in current.get("owned_instance_ids", []):
+                    raise JournalError("local ownership record changed before access")
+                current["owned_volume_ids"] = sorted(set(current.get("owned_volume_ids", [])) | known_owned_volume_ids)
+                current["borrowed_volume_ids"] = sorted(set(current.get("borrowed_volume_ids", [])) | borrowed_volume_ids)
+                self.journal.save(current)
+
+            volume_attachments, volume_rows = _volume_snapshot(self._list_volumes_required())
+            related_volume_ids = {
+                volume_id for volume_id, attached_instances in volume_attachments.items()
+                if iid in attached_instances
+            }
+            observed_volume_ids = direct_volume_ids | related_volume_ids
+            known_owned_volume_ids |= observed_volume_ids - preexisting_volume_ids
+            borrowed_volume_ids |= observed_volume_ids & preexisting_volume_ids
+            missing_volume_rows = direct_volume_ids - set(volume_rows)
+            with self.journal.locked(request_id):
+                current = self.journal.load(request_id)
+                if not current or iid not in current.get("owned_instance_ids", []):
+                    raise JournalError("local ownership record changed before access")
+                current["owned_volume_ids"] = sorted(set(current.get("owned_volume_ids", [])) | known_owned_volume_ids)
+                current["borrowed_volume_ids"] = sorted(set(current.get("borrowed_volume_ids", [])) | borrowed_volume_ids)
+                current["unresolved_volume_ids"] = sorted(set(current.get("unresolved_volume_ids", [])) | missing_volume_rows)
+                self.journal.save(current)
+            if borrowed_volume_ids:
+                raise LeaseError("attaching a pre-existing separately billed volume is not supported")
+            if missing_volume_rows:
+                raise LeaseError("provider volume listing did not confirm every volume attached to the new instance")
+
+            shared_record = self.guardian_gate.publish_owned_resources(
+                intent,
+                readiness,
+                instance_ids=(iid,),
+                volume_ids=tuple(sorted(known_owned_volume_ids)),
+            )
+            with self.journal.locked(request_id):
+                current = self.journal.load(request_id)
+                if not current or iid not in current.get("owned_instance_ids", []):
+                    raise JournalError("local ownership record changed before access")
+                current["guardian_registry_revision"] = shared_record.revision
+                self.journal.save(current)
+        except Exception as exc:
+            with self.journal.locked(request_id):
+                current = self.journal.load(request_id)
+                if current and current.get("owned_instance_ids"):
+                    current["state"] = "DESTROY_REQUIRED"
+                    current["failure"] = "resource_ownership_handoff_failed"
+                    current["resource_ownership_error"] = getattr(exc, "reason_code", type(exc).__name__)
+                    try:
+                        self.journal.save(current)
+                    except JournalError:
+                        pass
+            cleaned = self._cleanup_request(request_id)
+            self._supervisor().stop()
+            raise LeaseError("provider resource ownership and shared lease registration could not be verified; access was blocked and cleanup was attempted", cleaned or {}) from None
+
         if not handoff_allowed:
             self._cleanup_request(request_id)
             raise LeaseError("lease was reclaimed by its supervisor before access could be handed over", self.status(request_id))
@@ -371,7 +603,7 @@ class LeaseController:
                 record = self.reconcile_create_uncertain(rid)
             else:
                 record = self.status(rid)
-                if record and record.get("owned_instance_ids") and record.get("state") not in {"DESTROYED", "FAILED_CLEAN"}:
+                if record and (record.get("owned_instance_ids") or record.get("owned_volume_ids")) and record.get("state") not in {"DESTROYED", "FAILED_CLEAN"}:
                     record = self._cleanup_request(rid)
             if record:
                 results.append(record)
@@ -467,6 +699,14 @@ class LeaseController:
         except Exception as exc:
             raise LeaseError("provider listing is unavailable or malformed; absence is unverified") from exc
 
+    def _list_volumes_required(self) -> list[dict[str, Any]]:
+        try:
+            rows = self.provider.list_volumes()
+            _volume_snapshot(rows)
+            return rows
+        except Exception as exc:
+            raise LeaseError("provider volume listing is unavailable or malformed; volume absence is unverified") from exc
+
     def _await_started(self, request_id: str) -> dict[str, Any]:
         record = self.status(request_id)
         if not record:
@@ -550,7 +790,9 @@ class LeaseController:
             if record.get("state") in {"DESTROYED", "FAILED_CLEAN"}:
                 return record
             ids = list(dict.fromkeys(record.get("owned_instance_ids", [])))
-            if not ids:
+            volume_ids = list(dict.fromkeys(record.get("owned_volume_ids", [])))
+            unresolved_volume_ids = list(dict.fromkeys(record.get("unresolved_volume_ids", [])))
+            if not ids and not volume_ids and not unresolved_volume_ids:
                 if record.get("state") in {"CREATE_INTENT", "CREATE_IN_PROGRESS", "CREATE_UNCERTAIN"}:
                     return record
                 record["state"] = "CLEANUP_PENDING"
@@ -564,6 +806,61 @@ class LeaseController:
                 if not current:
                     return None
                 ids = list(dict.fromkeys(current.get("owned_instance_ids", [])))
+                volume_ids = list(dict.fromkeys(current.get("owned_volume_ids", [])))
+                unresolved_volume_ids = list(dict.fromkeys(current.get("unresolved_volume_ids", [])))
+                has_volume_baseline = "pre_create_volume_ids" in current
+                preexisting_volume_ids = set(current.get("pre_create_volume_ids", []))
+                direct_volume_ids = set()
+                if isinstance(current.get("instance"), Mapping):
+                    try:
+                        direct_volume_ids.update(_volume_ids(current["instance"]))
+                    except LeaseError:
+                        current.setdefault("cleanup_warnings", []).append("malformed_volume_ids_in_instance_record")
+                newly_owned = direct_volume_ids - preexisting_volume_ids if has_volume_baseline else set()
+                if not has_volume_baseline:
+                    current["unresolved_volume_ids"] = sorted(
+                        set(current.get("unresolved_volume_ids", [])) | (direct_volume_ids - set(volume_ids))
+                    )
+                volume_ids = list(dict.fromkeys(volume_ids + sorted(newly_owned)))
+                current["owned_volume_ids"] = volume_ids
+                self.journal.save(current)
+
+            # Learn every newly attached volume while the instance-to-volume relation is
+            # still visible. Never delete a volume that existed before this attempt.
+            volume_listing_error = None
+            pre_destroy_volume_listing_failed = False
+            try:
+                before_attachments, before_rows = _volume_snapshot(self._list_volumes_required())
+                attached_now = {
+                    volume_id for volume_id, attached in before_attachments.items()
+                    if set(attached) & set(ids)
+                }
+                direct_rows = direct_volume_ids & set(before_rows)
+                if has_volume_baseline:
+                    discovered_owned = (attached_now | direct_rows) - preexisting_volume_ids
+                    discovered_borrowed = (attached_now | direct_rows) & preexisting_volume_ids
+                    unidentified_attached = set()
+                else:
+                    discovered_owned = set()
+                    discovered_borrowed = set()
+                    unidentified_attached = attached_now - set(volume_ids)
+                with self.journal.locked(request_id):
+                    current = self.journal.load(request_id)
+                    if not current:
+                        return None
+                    current["owned_volume_ids"] = sorted(set(current.get("owned_volume_ids", [])) | discovered_owned)
+                    current["borrowed_volume_ids"] = sorted(set(current.get("borrowed_volume_ids", [])) | discovered_borrowed)
+                    unresolved = set(current.get("unresolved_volume_ids", [])) & set(before_rows)
+                    unresolved -= discovered_owned | discovered_borrowed
+                    current["unresolved_volume_ids"] = sorted(unresolved | unidentified_attached)
+                    self.journal.save(current)
+                    volume_ids = list(current["owned_volume_ids"])
+                    unresolved_volume_ids = list(current.get("unresolved_volume_ids", []))
+            except Exception as exc:
+                before_attachments, before_rows = {}, {}
+                volume_listing_error = type(exc).__name__
+                pre_destroy_volume_listing_failed = True
+
             for iid in ids:
                 try:
                     self.provider.destroy_instance(iid)
@@ -571,29 +868,78 @@ class LeaseController:
                     pass
             try:
                 rows = self._list_required()
-                present = {_instance_id(row) for row in rows}
+                present_instances = {_instance_id(row) for row in rows}
                 list_error = None
             except Exception as exc:
-                present = None
+                present_instances = None
                 list_error = type(exc).__name__
+            remaining_instances = [iid for iid in ids if present_instances is None or iid in present_instances]
+
+            # A volume can be deleted only after every instance using it is gone.
+            if not remaining_instances:
+                try:
+                    current_volume_attachments, current_volume_rows = _volume_snapshot(self._list_volumes_required())
+                    current_volume_ids = set(current_volume_rows)
+                    for volume_id in volume_ids:
+                        if volume_id not in current_volume_ids:
+                            continue
+                        attached = current_volume_attachments[volume_id]
+                        if attached:
+                            continue
+                        try:
+                            self.provider.destroy_volume(volume_id)
+                        except Exception:
+                            pass
+                    # The delete acknowledgement is not proof; a fresh complete listing is.
+                    _, verified_volume_rows = _volume_snapshot(self._list_volumes_required())
+                    present_volume_ids = set(verified_volume_rows)
+                    volume_listing_error = None
+                    if pre_destroy_volume_listing_failed and has_volume_baseline:
+                        unresolved_candidates = present_volume_ids - preexisting_volume_ids - set(volume_ids)
+                        if unresolved_candidates:
+                            with self.journal.locked(request_id):
+                                current = self.journal.load(request_id)
+                                if current:
+                                    current["unresolved_volume_ids"] = sorted(
+                                        set(current.get("unresolved_volume_ids", [])) | unresolved_candidates
+                                    )
+                                    self.journal.save(current)
+                except Exception as exc:
+                    present_volume_ids = None
+                    volume_listing_error = type(exc).__name__
+            else:
+                present_volume_ids = None
+
             with self.journal.locked(request_id):
                 current = self.journal.load(request_id)
                 if not current:
                     return None
                 all_owned = list(dict.fromkeys(current.get("owned_instance_ids", [])))
-                remaining = [iid for iid in all_owned if present is None or iid in present]
-                verification = {"attempt": attempt, "checked_at_utc": _utc(self.clock()), "remaining_instance_ids": remaining}
+                all_owned_volumes = list(dict.fromkeys(current.get("owned_volume_ids", [])))
+                unresolved_volume_ids = list(dict.fromkeys(current.get("unresolved_volume_ids", [])))
+                remaining = [iid for iid in all_owned if present_instances is None or iid in present_instances]
+                remaining_volumes = [vid for vid in all_owned_volumes if present_volume_ids is None or vid in present_volume_ids]
+                unresolved_present = [vid for vid in unresolved_volume_ids if present_volume_ids is None or vid in present_volume_ids]
+                verification = {
+                    "attempt": attempt,
+                    "checked_at_utc": _utc(self.clock()),
+                    "remaining_instance_ids": remaining,
+                    "remaining_volume_ids": sorted(set(remaining_volumes) | set(unresolved_present)),
+                }
                 if list_error:
-                    verification["error_type"] = list_error
+                    verification["instance_list_error_type"] = list_error
+                if volume_listing_error:
+                    verification["volume_list_error_type"] = volume_listing_error
                 current["verification"] = verification
-                if not remaining:
+                current["owned_instance_ids"] = all_owned if remaining else []
+                current["owned_volume_ids"] = all_owned_volumes if remaining_volumes else []
+                current["unresolved_volume_ids"] = unresolved_present
+                if not remaining and not remaining_volumes and not unresolved_present and volume_listing_error is None:
                     current["state"] = "DESTROYED"
                     current["confirmed_absent_at_utc"] = _utc(self.clock())
-                    current["owned_instance_ids"] = []
-                    current.setdefault("events", []).append({"at_utc": _utc(self.clock()), "event": "provider_absence_confirmed"})
+                    current.setdefault("events", []).append({"at_utc": _utc(self.clock()), "event": "provider_instance_and_volume_absence_confirmed"})
                     self.journal.save(current)
                     return current
                 current["state"] = "CLEANUP_PENDING"
-                current["owned_instance_ids"] = all_owned
                 self.journal.save(current)
         return self.status(request_id)

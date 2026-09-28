@@ -150,6 +150,28 @@ class VastOffersClient:
             token = next_token
         raise VastAPIError("instance listing exceeded its page limit; absence is unverified")
 
+    def list_volumes(self) -> list[dict[str, Any]]:
+        """Return the account's volume listing or fail closed on an invalid response."""
+        response = self._request("GET", "/volumes")
+        if response.get("success") is False:
+            raise VastAPIError("volume listing did not confirm success")
+        rows = response.get("volumes")
+        if not isinstance(rows, list) or any(not isinstance(item, dict) for item in rows):
+            raise VastAPIError("volume listing returned an invalid shape")
+        for row in rows:
+            try:
+                _positive_id(row.get("id"))
+            except ValueError:
+                raise VastAPIError("volume listing returned an invalid volume ID") from None
+        return rows
+
+    def destroy_volume(self, volume_id: int) -> dict[str, Any]:
+        """Request documented DELETE /volumes; callers must verify absence."""
+        response = self._request("DELETE", "/volumes", {"id": _positive_id(volume_id)})
+        if response.get("success") is not True:
+            raise VastAPIError("volume deletion did not confirm success")
+        return response
+
     def get_instance(self, instance_id: int) -> dict[str, Any]:
         """Fetch by ID using documented GET /instances/{id}."""
         response = self._request("GET", f"/instances/{_positive_id(instance_id)}")
