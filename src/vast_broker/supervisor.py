@@ -10,11 +10,15 @@ import argparse
 import importlib
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any
 
 from .journal import LeaseJournal
 from .lease import LeaseSupervisor
+
+
+_TERMINAL_STATES = {"DESTROYED", "FAILED_CLEAN"}
 
 
 def _factory(spec: str) -> Any:
@@ -25,6 +29,45 @@ def _factory(spec: str) -> Any:
     return result
 
 
+def _safe_exception_type(exc: BaseException) -> str:
+    """Record the error class without storing its message or possible credentials."""
+    name = type(exc).__name__
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:80]
+    return safe or "Exception"
+
+
+def _begin_attempt(journal: LeaseJournal, request_id: str) -> int | None:
+    with journal.locked(request_id):
+        record = journal.load(request_id)
+        if record is None:
+            return None
+        attempt = int(record.get("supervisor_attempt_count", 0)) + 1
+        now = time.time()
+        record["supervisor_attempt_count"] = attempt
+        record["supervisor_last_attempt_epoch"] = now
+        record["supervisor_last_attempt_state"] = "running"
+        record["supervisor_heartbeat_epoch"] = now
+        journal.save(record)
+        return attempt
+
+
+def _finish_attempt(journal: LeaseJournal, request_id: str, attempt: int, *,
+                    error: dict[str, str] | None = None) -> dict[str, Any] | None:
+    with journal.locked(request_id):
+        record = journal.load(request_id)
+        if record is None:
+            return None
+        now = time.time()
+        record["supervisor_attempt_count"] = attempt
+        record["supervisor_last_attempt_epoch"] = now
+        record["supervisor_last_attempt_state"] = "failed" if error else "succeeded"
+        record["supervisor_heartbeat_epoch"] = now
+        if error:
+            record["supervisor_last_error"] = {**error, "at_epoch": now}
+        journal.save(record)
+        return record
+
+
 def serve(request_id: str, *, poll_seconds: float = 2.0, ready_file: str | None = None) -> None:
     journal_dir = os.environ["VAST_BROKER_JOURNAL_DIR"]
     provider = _factory(os.environ["VAST_BROKER_PROVIDER_FACTORY"])
@@ -33,14 +76,25 @@ def serve(request_id: str, *, poll_seconds: float = 2.0, ready_file: str | None 
     if ready_file:
         Path(ready_file).write_text("ready", encoding="utf-8")
     while True:
+        attempt = _begin_attempt(journal, request_id)
+        if attempt is None:
+            return
         try:
             record = supervisor.tick(request_id)
-            if record is None or record.get("state") in {"DESTROYED", "FAILED_CLEAN"}:
-                return
-            # Unresolved create outcomes stay journaled and are reconciled on each tick.
-        except Exception:
-            # Preserve the journal obligation; next pass retries after transient faults.
-            pass
+        except Exception as exc:
+            _finish_attempt(journal, request_id, attempt, error={
+                "code": "tick_failed",
+                "exception_type": _safe_exception_type(exc),
+            })
+            time.sleep(poll_seconds)
+            continue
+
+        current = _finish_attempt(journal, request_id, attempt)
+        if record is None or record.get("state") in _TERMINAL_STATES or (
+            current and current.get("state") in _TERMINAL_STATES
+        ):
+            return
+        # Unresolved create outcomes stay journaled and are reconciled on each tick.
         time.sleep(poll_seconds)
 
 

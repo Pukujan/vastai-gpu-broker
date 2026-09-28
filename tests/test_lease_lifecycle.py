@@ -93,6 +93,7 @@ class FakeProvider:
         self.list_volume_error_after_create = False
         self.delete_volume_error = False
         self.created_volume_ids: list[str] = []
+        self.omit_volume_ids_in_instance = False
         self.volumes: dict[str, dict[str, Any]] = {}
         self.cleanup_events: list[tuple[str, str]] = []
         self.lock = threading.Lock()
@@ -118,7 +119,7 @@ class FakeProvider:
             self.creates += 1
             iid = str(self.creates)
             row = {"id": iid, "label": params["label"], "status": "running", "offer_id": offer_id}
-            if self.created_volume_ids:
+            if self.created_volume_ids and not self.omit_volume_ids_in_instance:
                 row["volume_ids"] = list(self.created_volume_ids)
             self.instances[iid] = row
             for volume_id in self.created_volume_ids:
@@ -239,6 +240,92 @@ def test_volume_listing_outage_never_claims_clean_and_recovers_by_retry(tmp_path
     provider.list_volume_error_after_create = False
     assert ctl.reconcile("volume-list-outage")[0]["state"] == "DESTROYED"
     assert provider.volumes == {}
+
+
+def test_volume_inventory_outage_preserves_instance_until_attachment_is_discovered(tmp_path):
+    provider = FakeProvider()
+    provider.created_volume_ids = ["906"]
+    provider.omit_volume_ids_in_instance = True
+    provider.list_volume_error_after_create = True
+    journal = LeaseJournal(tmp_path)
+    ctl = LeaseController(provider, journal, FakeSupervisor(), guardian_gate=FakeGuardianGate())
+
+    with pytest.raises(LeaseError, match="access was blocked") as error:
+        ctl.run("volume-discovery-retry", plan(), lambda _: pytest.fail("operation must not run"))
+
+    assert error.value.result["state"] == "CLEANUP_PENDING"
+    assert "1" in provider.instances
+    assert provider.instances["1"]["status"] == "running"
+    assert provider.volumes["906"]["instances"] == [{"id": "1"}]
+    assert provider.destroy_calls == []
+    assert journal.load("volume-discovery-retry")["volume_discovery_pending"] is True
+
+    provider.list_volume_error_after_create = False
+    recovered = ctl.reconcile("volume-discovery-retry")[0]
+
+    assert recovered["state"] == "DESTROYED"
+    assert provider.instances == {}
+    assert provider.volumes == {}
+    assert provider.cleanup_events == [("instance", "1"), ("volume", "906")]
+
+
+def test_reconcile_retries_unresolved_volume_without_deleting_uncertain_ownership(tmp_path):
+    provider = FakeProvider()
+    provider.volumes["907"] = {"instances": []}
+    journal = LeaseJournal(tmp_path)
+    journal.save({
+        "request_id": "unresolved-volume-restart",
+        "state": "CLEANUP_PENDING",
+        "owned_instance_ids": [],
+        "owned_volume_ids": [],
+        "unresolved_volume_ids": ["907"],
+        "pre_create_volume_ids": [],
+        "events": [],
+    })
+    ctl = controller(tmp_path, provider)
+
+    pending = ctl.reconcile()[0]
+
+    assert pending["state"] == "CLEANUP_PENDING"
+    assert pending["verification"]["remaining_volume_ids"] == ["907"]
+    assert provider.volumes == {"907": {"instances": []}}
+    assert provider.cleanup_events == []
+    assert provider.destroy_calls == []
+
+    # A fresh provider read can close the obligation after independent deletion;
+    # the broker must not issue a delete for a volume whose ownership was uncertain.
+    provider.volumes.pop("907")
+    recovered = ctl.reconcile("unresolved-volume-restart")[0]
+
+    assert recovered["state"] == "DESTROYED"
+    assert provider.cleanup_events == []
+
+
+def test_missing_volume_discovery_anchor_keeps_orphan_volume_obligation_pending(tmp_path):
+    provider = FakeProvider()
+    provider.volumes["908"] = {"instances": []}
+    journal = LeaseJournal(tmp_path)
+    journal.save({
+        "request_id": "missing-discovery-anchor",
+        "state": "CLEANUP_PENDING",
+        "owned_instance_ids": ["1"],
+        "owned_volume_ids": [],
+        "unresolved_volume_ids": [],
+        "volume_discovery_pending": True,
+        "pre_create_volume_ids": [],
+        "events": [],
+    })
+    ctl = controller(tmp_path, provider)
+
+    pending = ctl.reconcile()[0]
+
+    assert pending["state"] == "CLEANUP_PENDING"
+    assert pending["volume_discovery_pending"] is True
+    assert pending["owned_instance_ids"] == ["1"]
+    assert pending["verification"]["volume_discovery_anchor_error_type"] == "DiscoveryAnchorMissing"
+    assert provider.volumes == {"908": {"instances": []}}
+    assert provider.cleanup_events == []
+    assert provider.destroy_calls == []
 
 
 def test_preexisting_attached_volume_is_preserved_and_access_is_blocked(tmp_path):

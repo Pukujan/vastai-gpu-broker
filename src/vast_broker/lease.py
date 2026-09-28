@@ -603,7 +603,12 @@ class LeaseController:
                 record = self.reconcile_create_uncertain(rid)
             else:
                 record = self.status(rid)
-                if record and (record.get("owned_instance_ids") or record.get("owned_volume_ids")) and record.get("state") not in {"DESTROYED", "FAILED_CLEAN"}:
+                if record and (
+                    record.get("owned_instance_ids")
+                    or record.get("owned_volume_ids")
+                    or record.get("unresolved_volume_ids")
+                    or record.get("volume_discovery_pending")
+                ) and record.get("state") not in {"DESTROYED", "FAILED_CLEAN"}:
                     record = self._cleanup_request(rid)
             if record:
                 results.append(record)
@@ -792,7 +797,8 @@ class LeaseController:
             ids = list(dict.fromkeys(record.get("owned_instance_ids", [])))
             volume_ids = list(dict.fromkeys(record.get("owned_volume_ids", [])))
             unresolved_volume_ids = list(dict.fromkeys(record.get("unresolved_volume_ids", [])))
-            if not ids and not volume_ids and not unresolved_volume_ids:
+            if (not ids and not volume_ids and not unresolved_volume_ids
+                    and not record.get("volume_discovery_pending")):
                 if record.get("state") in {"CREATE_INTENT", "CREATE_IN_PROGRESS", "CREATE_UNCERTAIN"}:
                     return record
                 record["state"] = "CLEANUP_PENDING"
@@ -823,49 +829,94 @@ class LeaseController:
                     )
                 volume_ids = list(dict.fromkeys(volume_ids + sorted(newly_owned)))
                 current["owned_volume_ids"] = volume_ids
+                known_volume_references = (
+                    direct_volume_ids
+                    | set(volume_ids)
+                    | set(current.get("borrowed_volume_ids", []))
+                    | set(current.get("unresolved_volume_ids", []))
+                )
+                volume_discovery_anchor_required = (
+                    bool(current.get("volume_discovery_pending"))
+                    and bool(ids)
+                    and not known_volume_references
+                )
                 self.journal.save(current)
 
             # Learn every newly attached volume while the instance-to-volume relation is
             # still visible. Never delete a volume that existed before this attempt.
             volume_listing_error = None
             pre_destroy_volume_listing_failed = False
-            try:
-                before_attachments, before_rows = _volume_snapshot(self._list_volumes_required())
-                attached_now = {
-                    volume_id for volume_id, attached in before_attachments.items()
-                    if set(attached) & set(ids)
-                }
-                direct_rows = direct_volume_ids & set(before_rows)
-                if has_volume_baseline:
-                    discovered_owned = (attached_now | direct_rows) - preexisting_volume_ids
-                    discovered_borrowed = (attached_now | direct_rows) & preexisting_volume_ids
-                    unidentified_attached = set()
-                else:
-                    discovered_owned = set()
-                    discovered_borrowed = set()
-                    unidentified_attached = attached_now - set(volume_ids)
-                with self.journal.locked(request_id):
-                    current = self.journal.load(request_id)
-                    if not current:
-                        return None
-                    current["owned_volume_ids"] = sorted(set(current.get("owned_volume_ids", [])) | discovered_owned)
-                    current["borrowed_volume_ids"] = sorted(set(current.get("borrowed_volume_ids", [])) | discovered_borrowed)
-                    unresolved = set(current.get("unresolved_volume_ids", [])) & set(before_rows)
-                    unresolved -= discovered_owned | discovered_borrowed
-                    current["unresolved_volume_ids"] = sorted(unresolved | unidentified_attached)
-                    self.journal.save(current)
-                    volume_ids = list(current["owned_volume_ids"])
-                    unresolved_volume_ids = list(current.get("unresolved_volume_ids", []))
-            except Exception as exc:
-                before_attachments, before_rows = {}, {}
-                volume_listing_error = type(exc).__name__
-                pre_destroy_volume_listing_failed = True
-
-            for iid in ids:
+            discovery_anchor_error = None
+            if volume_discovery_anchor_required:
                 try:
-                    self.provider.destroy_instance(iid)
-                except Exception:
-                    pass
+                    anchor_rows = self._list_required()
+                    present_anchor_ids = {_instance_id(row) for row in anchor_rows}
+                    if not set(ids).issubset(present_anchor_ids):
+                        discovery_anchor_error = "DiscoveryAnchorMissing"
+                except Exception as exc:
+                    discovery_anchor_error = type(exc).__name__
+
+            if discovery_anchor_error:
+                # An earlier inventory outage made the instance the only ownership
+                # anchor. If it has since disappeared, do not infer that its volumes
+                # were also removed; preserve the unresolved obligation for recovery.
+                before_attachments, before_rows = {}, {}
+            else:
+                try:
+                    before_attachments, before_rows = _volume_snapshot(self._list_volumes_required())
+                    attached_now = {
+                        volume_id for volume_id, attached in before_attachments.items()
+                        if set(attached) & set(ids)
+                    }
+                    direct_rows = direct_volume_ids & set(before_rows)
+                    if has_volume_baseline:
+                        discovered_owned = (attached_now | direct_rows) - preexisting_volume_ids
+                        discovered_borrowed = (attached_now | direct_rows) & preexisting_volume_ids
+                        unidentified_attached = set()
+                    else:
+                        discovered_owned = set()
+                        discovered_borrowed = set()
+                        unidentified_attached = attached_now - set(volume_ids)
+                    with self.journal.locked(request_id):
+                        current = self.journal.load(request_id)
+                        if not current:
+                            return None
+                        current["owned_volume_ids"] = sorted(set(current.get("owned_volume_ids", [])) | discovered_owned)
+                        current["borrowed_volume_ids"] = sorted(set(current.get("borrowed_volume_ids", [])) | discovered_borrowed)
+                        unresolved = set(current.get("unresolved_volume_ids", [])) & set(before_rows)
+                        unresolved -= discovered_owned | discovered_borrowed
+                        current["unresolved_volume_ids"] = sorted(unresolved | unidentified_attached)
+                        current["volume_discovery_pending"] = False
+                        self.journal.save(current)
+                        volume_ids = list(current["owned_volume_ids"])
+                        unresolved_volume_ids = list(current.get("unresolved_volume_ids", []))
+                except Exception as exc:
+                    before_attachments, before_rows = {}, {}
+                    volume_listing_error = type(exc).__name__
+                    pre_destroy_volume_listing_failed = True
+                    if ids and not known_volume_references:
+                        # Keep the instance alive until a complete volume listing can reveal
+                        # its attachments; destroying it now can erase the only association.
+                        with self.journal.locked(request_id):
+                            current = self.journal.load(request_id)
+                            if current:
+                                current["volume_discovery_pending"] = True
+                                self.journal.save(current)
+
+            hold_instance_for_volume_discovery = (
+                discovery_anchor_error is not None
+                or (
+                    pre_destroy_volume_listing_failed
+                    and bool(ids)
+                    and not known_volume_references
+                )
+            )
+            if not hold_instance_for_volume_discovery:
+                for iid in ids:
+                    try:
+                        self.provider.destroy_instance(iid)
+                    except Exception:
+                        pass
             try:
                 rows = self._list_required()
                 present_instances = {_instance_id(row) for row in rows}
@@ -930,11 +981,20 @@ class LeaseController:
                     verification["instance_list_error_type"] = list_error
                 if volume_listing_error:
                     verification["volume_list_error_type"] = volume_listing_error
+                if discovery_anchor_error:
+                    verification["volume_discovery_anchor_error_type"] = discovery_anchor_error
                 current["verification"] = verification
-                current["owned_instance_ids"] = all_owned if remaining else []
+                keep_instance_as_discovery_anchor = bool(current.get("volume_discovery_pending"))
+                current["owned_instance_ids"] = all_owned if remaining or keep_instance_as_discovery_anchor else []
                 current["owned_volume_ids"] = all_owned_volumes if remaining_volumes else []
                 current["unresolved_volume_ids"] = unresolved_present
-                if not remaining and not remaining_volumes and not unresolved_present and volume_listing_error is None:
+                if (
+                    not remaining
+                    and not remaining_volumes
+                    and not unresolved_present
+                    and volume_listing_error is None
+                    and not current.get("volume_discovery_pending")
+                ):
                     current["state"] = "DESTROYED"
                     current["confirmed_absent_at_utc"] = _utc(self.clock())
                     current.setdefault("events", []).append({"at_utc": _utc(self.clock()), "event": "provider_instance_and_volume_absence_confirmed"})
