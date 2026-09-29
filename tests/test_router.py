@@ -1,5 +1,6 @@
 import hashlib
 import json
+import random
 import unittest
 from datetime import datetime, timezone
 from copy import deepcopy
@@ -166,6 +167,75 @@ class RouterGateTests(unittest.TestCase):
         self.assertEqual(result["state"], "BLOCKED_CAPACITY_OR_FIT")
         rejected = result["candidate_comparisons"][self.key]["offer_comparison"]["ranking"]["rejected"]
         self.assertIn("download_network_price_above_per_tb_cap", rejected[0]["reasons"])
+
+    def test_hourly_cap_includes_network_and_startup_cost(self):
+        self.request["paid_authorization"] = {
+            "authorized": True, "scope": "exact_artifact",
+            "provenance": {"type": "user_task", "value": "host this exact artifact"},
+        }
+        market = deepcopy(self.market)
+        raw = dict(market["offers"][0]["raw"])
+        raw.update({"id": 23, "dph_total": 0.17})
+        market["offers"] = [normalize_offer(raw)]
+        limits = {**LIMITS, "max_hourly_usd": 0.20, "max_total_usd": 0.30,
+                  "max_runtime_seconds": 3600, "max_network_usd": 0.05}
+        result = route_request(self.request, evidence_by_candidate={self.key: self.evidence},
+                               market=market, limits=limits,
+                               now_utc=datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(result["state"], "BLOCKED_HOURLY_CAP")
+        self.assertFalse(result["paid_action_allowed"])
+
+    def test_under_cap_offer_counts_network_inside_hourly_and_total_bounds(self):
+        self.request["paid_authorization"] = {
+            "authorized": True, "scope": "exact_artifact",
+            "provenance": {"type": "user_task", "value": "host this exact artifact"},
+        }
+        market = deepcopy(self.market)
+        raw = dict(market["offers"][0]["raw"])
+        raw.update({"id": 24, "dph_total": 0.1233333333333333})
+        market["offers"] = [normalize_offer(raw)]
+        limits = {**LIMITS, "max_hourly_usd": 0.20, "max_total_usd": 0.20,
+                  "max_runtime_seconds": 3600, "max_network_usd": 0.05}
+        result = route_request(self.request, evidence_by_candidate={self.key: self.evidence},
+                               market=market, limits=limits,
+                               now_utc=datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(result["state"], "READY_TO_RUN")
+        bound = result["proposal"]["cost_bound"]
+        self.assertAlmostEqual(bound["all_in_hourly_usd"], bound["worst_case_total_usd"])
+        self.assertLessEqual(bound["all_in_hourly_usd"], limits["max_hourly_usd"])
+        self.assertLessEqual(bound["worst_case_total_usd"], limits["max_total_usd"])
+
+    def test_seeded_cost_fuzzer_never_relaxes_hourly_cap_when_network_or_gpu_price_rises(self):
+        rng = random.Random(20260929)
+        for case in range(500):
+            runtime = rng.choice((300, 900, 1800, 3600, 7200))
+            startup = rng.choice((60, 120, 300, 600))
+            machine_rate = round(rng.uniform(0.001, 0.24), 6)
+            network_budget = round(rng.uniform(0, 0.12), 6)
+            offer = {"rental_type": "ondemand", "machine_hour_usd": machine_rate}
+            limits = {"max_runtime_seconds": runtime, "start_deadline_seconds": startup,
+                      "max_network_usd": network_budget, "temporary_disk_gb": 60}
+            base = router_module._bounded_cost(offer, limits)
+            self.assertIsNotNone(base, case)
+
+            # Pick caps on both sides of the computed rate, then increase one
+            # paid component. A cost increase cannot turn a rejection into a pass.
+            hourly_cap = round(base["all_in_hourly_usd"] * rng.uniform(0.5, 1.5), 6)
+            limits["max_hourly_usd"] = hourly_cap
+            base_allowed = router_module._within_hourly_cap(base, limits)
+
+            higher_network_limits = dict(limits)
+            higher_network_limits["max_network_usd"] = network_budget + round(rng.uniform(0.000001, 0.05), 6)
+            higher_network = router_module._bounded_cost(offer, higher_network_limits)
+            self.assertGreaterEqual(higher_network["all_in_hourly_usd"], base["all_in_hourly_usd"], case)
+            if not base_allowed:
+                self.assertFalse(router_module._within_hourly_cap(higher_network, higher_network_limits), case)
+
+            higher_gpu_offer = {**offer, "machine_hour_usd": machine_rate + round(rng.uniform(0.000001, 0.1), 6)}
+            higher_gpu = router_module._bounded_cost(higher_gpu_offer, limits)
+            self.assertGreaterEqual(higher_gpu["all_in_hourly_usd"], base["all_in_hourly_usd"], case)
+            if not base_allowed:
+                self.assertFalse(router_module._within_hourly_cap(higher_gpu, limits), case)
 
     def test_stale_or_malformed_market_data_blocks_any_plan(self):
         result = route_request(self.request, evidence_by_candidate={self.key: self.evidence},

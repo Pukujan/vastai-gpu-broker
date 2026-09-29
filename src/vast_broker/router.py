@@ -243,7 +243,7 @@ def _limits_valid(limits: Mapping[str, Any]) -> bool:
 
 
 def _bounded_cost(offer: Mapping[str, Any], limits: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Worst-case machine exposure over the authorized startup/runtime envelope."""
+    """Worst-case all-in exposure over the authorized startup/runtime envelope."""
     try:
         hourly = Decimal(str(offer["machine_hour_usd"]))
         runtime = Decimal(str(limits["max_runtime_seconds"]))
@@ -259,13 +259,32 @@ def _bounded_cost(offer: Mapping[str, Any], limits: Mapping[str, Any]) -> dict[s
         return None
     machine = hourly * (runtime + startup) / Decimal(3600)
     total = machine + network
+    # The owner hourly limit includes the full network allowance. Spread that
+    # allowance over useful runtime and charge startup against the numerator.
+    # This is conservative when setup ends before the runtime deadline.
+    all_in_hourly = total * Decimal(3600) / runtime if runtime > 0 else None
+    if all_in_hourly is None or not all_in_hourly.is_finite():
+        return None
     return {"machine_and_included_storage_usd": float(machine),
             "network_allowance_usd": float(network), "worst_case_total_usd": float(total),
+            "all_in_hourly_usd": float(all_in_hourly),
             "hourly_rate_basis_usd_per_machine_hour": float(hourly),
             "temporary_disk_gb": float(limits["temporary_disk_gb"]),
             "time_envelope_seconds": float(runtime + startup),
-            "formula": "machine_hour_usd * (max_runtime_seconds + start_deadline_seconds) / 3600 + max_network_usd",
+            "formula": "(machine_hour_usd * (max_runtime_seconds + start_deadline_seconds) / 3600 + max_network_usd) * 3600 / max_runtime_seconds",
             "status": "bounded_estimate_not_invoice"}
+
+
+def _within_hourly_cap(bound: Mapping[str, Any] | None, limits: Mapping[str, Any]) -> bool:
+    """Check the owner cap against compute, startup, and network together."""
+    if not isinstance(bound, Mapping):
+        return False
+    try:
+        all_in = Decimal(str(bound["all_in_hourly_usd"]))
+        cap = Decimal(str(limits["max_hourly_usd"]))
+    except (KeyError, InvalidOperation, ValueError, TypeError):
+        return False
+    return all_in.is_finite() and cap.is_finite() and all_in >= 0 and cap >= 0 and all_in <= cap
 
 
 def _market_snapshot_problem(market: Mapping[str, Any], now: datetime,
@@ -488,32 +507,24 @@ def route_request(request: Mapping[str, Any], *, evidence_by_candidate: Mapping[
                 "next_action": "request_concrete_owner_limits_before_any_create_call",
                 "required_inputs": missing or ["valid finite non-negative limit values"],
                 "candidate_comparisons": comparisons, "paid_action_allowed": False}
-    under_hourly_cap = []
+    hourly_eligible: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
     for item in action_offers:
-        try:
-            item_rate = Decimal(str(item.get("machine_hour_usd")))
-        except (InvalidOperation, TypeError, ValueError):
+        if item.get("rental_type") == "bid" and (
+                limits.get("max_bid_usd_per_machine_hour") is None
+                or limits["max_bid_usd_per_machine_hour"] > limits["max_hourly_usd"]):
             continue
-        if item_rate.is_finite() and item_rate >= 0 and item_rate <= Decimal(str(limits["max_hourly_usd"])):
-            under_hourly_cap.append(item)
-    if not under_hourly_cap:
+        bound = _bounded_cost(item, limits)
+        if _within_hourly_cap(bound, limits):
+            hourly_eligible.append((item, bound))  # type: ignore[arg-type]
+    if not hourly_eligible:
         return {"request_id": request.get("request_id"), "state": "BLOCKED_HOURLY_CAP",
-                "next_action": "report_candidate_prices_above_owner_hourly_cap",
+                "next_action": "report_all_in_hourly_cost_above_owner_cap",
                 "candidate_comparisons": comparisons, "paid_action_allowed": False}
     costed_offers = []
-    for item in under_hourly_cap:
-        if item.get("rental_type") == "bid":
-            if (limits.get("max_bid_usd_per_machine_hour") is None
-                    or limits["max_bid_usd_per_machine_hour"] > limits["max_hourly_usd"]):
-                continue
-        bound = _bounded_cost(item, limits)
-        if bound is not None and bound["worst_case_total_usd"] <= limits["max_total_usd"]:
+    for item, bound in hourly_eligible:
+        if bound["worst_case_total_usd"] <= limits["max_total_usd"]:
             costed_offers.append((item, bound))
     if not costed_offers:
-        if any(o.get("rental_type") == "bid" for o in under_hourly_cap) and limits.get("max_bid_usd_per_machine_hour") is not None and limits["max_bid_usd_per_machine_hour"] > limits["max_hourly_usd"]:
-            return {"request_id": request.get("request_id"), "state": "BLOCKED_HOURLY_CAP",
-                    "next_action": "report_interruptible_bid_cap_exceeds_owner_hourly_cap",
-                    "candidate_comparisons": comparisons, "paid_action_allowed": False}
         return {"request_id": request.get("request_id"), "state": "BLOCKED_TOTAL_CAP",
                 "next_action": "report_bounded_cost_above_owner_total_cap",
                 "candidate_comparisons": comparisons,
@@ -724,6 +735,8 @@ def _validate_plan_binding(proposal: Mapping[str, Any], plan: Mapping[str, Any],
     if (computed_total is None or not total_cap.is_finite() or computed_total > total_cap
             or stated_total != computed_total):
         raise ValueError("proposal cost bound does not match the approved limits")
+    if not _within_hourly_cap(bound, limits):
+        raise ValueError("proposal all-in hourly cost exceeds the approved hourly cap")
 
 
 __all__ = ["route_request", "review_candidate", "candidate_key", "authorize_run"]
