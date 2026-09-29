@@ -65,12 +65,15 @@ class LeaseJournal:
             with lock_path.open("a+b") as handle:
                 if os.name == "nt":
                     import msvcrt
-                    handle.seek(0)
-                    if handle.read(1) == b"":
-                        handle.seek(0)
+                    # Check file size without reading the lock byte: a different
+                    # process may already hold the byte-range lock, and Windows
+                    # can reject that read with PermissionError before we wait.
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.seek(0, os.SEEK_SET)
                         handle.write(b"0")
                         handle.flush()
-                    handle.seek(0)
+                    handle.seek(0, os.SEEK_SET)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                     try:
                         depths[key] = 1
@@ -92,6 +95,11 @@ class LeaseJournal:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def load(self, request_id: str) -> dict[str, Any] | None:
+        key = self._key(request_id)
+        depths = getattr(self._depth, "values", {})
+        if not depths.get(key, 0):
+            with self.locked(request_id):
+                return self.load(request_id)
         path = self._record_path(request_id)
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -107,6 +115,12 @@ class LeaseJournal:
 
     def save(self, record: dict[str, Any]) -> None:
         request_id = record.get("request_id")
+        key = self._key(request_id)
+        depths = getattr(self._depth, "values", {})
+        if not depths.get(key, 0):
+            with self.locked(request_id):
+                self.save(record)
+            return
         path = self._record_path(request_id)
         payload = dict(record)
         payload["schema_version"] = self.SCHEMA_VERSION

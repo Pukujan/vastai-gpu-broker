@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -87,6 +88,39 @@ def test_worker_persists_sanitized_tick_error_and_recovers(tmp_path, monkeypatch
     assert record["supervisor_last_error"]["exception_type"] == "RuntimeError"
     assert "credential-must-not-be-saved" not in serialized
     assert "VAST_API_KEY" not in serialized
+
+
+def test_worker_heartbeat_advances_while_tick_is_blocked(tmp_path, monkeypatch):
+    journal_dir = tmp_path / "journal"
+    journal = LeaseJournal(journal_dir)
+    journal.save({"request_id": "blocked-tick", "state": "READY", "events": []})
+    monkeypatch.setenv("VAST_BROKER_JOURNAL_DIR", str(journal_dir))
+    monkeypatch.setenv("VAST_BROKER_PROVIDER_FACTORY", "lease_worker_fakes:make_provider")
+    tick_entered = threading.Event()
+    release_tick = threading.Event()
+    heartbeat_at_tick = []
+
+    class BlockingTick:
+        def __init__(self, provider, journal):
+            self.journal = journal
+
+        def tick(self, request_id):
+            heartbeat_at_tick.append(self.journal.load(request_id)["supervisor_heartbeat_epoch"])
+            tick_entered.set()
+            assert release_tick.wait(timeout=2)
+            return {"request_id": request_id, "state": "DESTROYED"}
+
+    monkeypatch.setattr(worker_module, "LeaseSupervisor", BlockingTick)
+    worker = threading.Thread(target=worker_module.serve, args=("blocked-tick",), kwargs={"poll_seconds": 0.02})
+    worker.start()
+    assert tick_entered.wait(timeout=1)
+    time.sleep(0.06)
+    heartbeat_during_tick = journal.load("blocked-tick")["supervisor_heartbeat_epoch"]
+    release_tick.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert heartbeat_during_tick > heartbeat_at_tick[0]
 
 
 def test_worker_stops_after_failed_clean_terminal_state(tmp_path, monkeypatch):
@@ -175,3 +209,133 @@ def test_unexpected_child_exit_restarts_until_lease_is_terminal(tmp_path):
         time.sleep(0.01)
     assert journal.load("restart-child")["supervisor_child_status"] == "stopped_terminal"
     assert len(children) == 2
+
+
+def test_stale_worker_heartbeat_terminates_child_before_restart(tmp_path):
+    journal = LeaseJournal(tmp_path / "journal")
+    journal.save({
+        "request_id": "stale-heartbeat",
+        "state": "READY",
+        "supervisor_heartbeat_epoch": time.time(),
+        "events": [],
+    })
+    children = []
+    replacement_started = threading.Event()
+
+    class FakeChild:
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+    def fake_popen(command, **kwargs):
+        child = FakeChild()
+        children.append(child)
+        ready_path = Path(command[command.index("--ready-file") + 1])
+        ready_path.write_text("ready", encoding="utf-8")
+        if len(children) == 2:
+            with journal.locked("stale-heartbeat"):
+                record = journal.load("stale-heartbeat")
+                record["state"] = "DESTROYED"
+                journal.save(record)
+            child.returncode = 0
+            replacement_started.set()
+        return child
+
+    worker = ProcessLeaseSupervisor(
+        journal.directory,
+        provider_factory="fake:make_provider",
+        poll_seconds=0.01,
+        startup_timeout_seconds=1,
+        heartbeat_timeout_seconds=0.05,
+        terminate_timeout_seconds=0.2,
+        popen=fake_popen,
+    )
+    worker.start("stale-heartbeat")
+    assert replacement_started.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        record = journal.load("stale-heartbeat")
+        if (len(children) >= 2 and record.get("state") == "DESTROYED"
+                and record.get("supervisor_child_status") == "stopped_terminal"):
+            break
+        time.sleep(0.005)
+    assert len(children) == 2
+    assert children[0].returncode == -15
+    assert children[1].returncode == 0
+    record = journal.load("stale-heartbeat")
+    assert record["supervisor_child_restart_count"] == 1
+    assert record["supervisor_child_last_error"]["code"] == "worker_heartbeat_stale"
+    assert record["state"] == "DESTROYED"
+    assert journal.load("stale-heartbeat")["supervisor_child_status"] == "stopped_terminal"
+    assert len(children) == 2
+
+
+def test_stalled_tick_is_terminated_even_while_heartbeat_is_fresh(tmp_path):
+    journal = LeaseJournal(tmp_path / "journal")
+    journal.save({
+        "request_id": "stalled-tick",
+        "state": "READY",
+        "supervisor_heartbeat_epoch": time.time(),
+        "supervisor_last_attempt_epoch": time.time() - 10,
+        "supervisor_last_attempt_state": "running",
+        "events": [],
+    })
+    children = []
+    replacement_started = threading.Event()
+
+    class FakeChild:
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+    def fake_popen(command, **kwargs):
+        child = FakeChild()
+        children.append(child)
+        ready_path = Path(command[command.index("--ready-file") + 1])
+        ready_path.write_text("ready", encoding="utf-8")
+        if len(children) == 2:
+            with journal.locked("stalled-tick"):
+                record = journal.load("stalled-tick")
+                record["state"] = "DESTROYED"
+                journal.save(record)
+            child.returncode = 0
+            replacement_started.set()
+        return child
+
+    worker = ProcessLeaseSupervisor(
+        journal.directory,
+        provider_factory="fake:make_provider",
+        poll_seconds=0.01,
+        startup_timeout_seconds=1,
+        heartbeat_timeout_seconds=1,
+        tick_timeout_seconds=0.05,
+        terminate_timeout_seconds=0.2,
+        popen=fake_popen,
+    )
+    worker.start("stalled-tick")
+    assert replacement_started.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        record = journal.load("stalled-tick")
+        if (len(children) >= 2 and record.get("state") == "DESTROYED"
+                and record.get("supervisor_child_status") == "stopped_terminal"):
+            break
+        time.sleep(0.005)
+    assert len(children) == 2
+    assert children[0].returncode == -15
+    assert children[1].returncode == 0
+    record = journal.load("stalled-tick")
+    assert record["supervisor_child_restart_count"] == 1
+    assert record["supervisor_child_last_error"]["code"] == "worker_attempt_stale"
+    assert record["state"] == "DESTROYED"
+    assert record["supervisor_child_status"] == "stopped_terminal"

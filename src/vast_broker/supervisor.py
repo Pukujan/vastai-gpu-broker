@@ -11,6 +11,7 @@ import importlib
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 
@@ -68,6 +69,18 @@ def _finish_attempt(journal: LeaseJournal, request_id: str, attempt: int, *,
         return record
 
 
+def _heartbeat_loop(journal: LeaseJournal, request_id: str, stop: threading.Event,
+                    interval_seconds: float) -> None:
+    """Keep worker liveness fresh even while a bounded provider call is in progress."""
+    while not stop.wait(interval_seconds):
+        with journal.locked(request_id):
+            record = journal.load(request_id)
+            if record is None or record.get("state") in _TERMINAL_STATES:
+                return
+            record["supervisor_heartbeat_epoch"] = time.time()
+            journal.save(record)
+
+
 def serve(request_id: str, *, poll_seconds: float = 2.0, ready_file: str | None = None) -> None:
     journal_dir = os.environ["VAST_BROKER_JOURNAL_DIR"]
     provider = _factory(os.environ["VAST_BROKER_PROVIDER_FACTORY"])
@@ -75,27 +88,40 @@ def serve(request_id: str, *, poll_seconds: float = 2.0, ready_file: str | None 
     supervisor = LeaseSupervisor(provider, journal)
     if ready_file:
         Path(ready_file).write_text("ready", encoding="utf-8")
-    while True:
-        attempt = _begin_attempt(journal, request_id)
-        if attempt is None:
-            return
-        try:
-            record = supervisor.tick(request_id)
-        except Exception as exc:
-            _finish_attempt(journal, request_id, attempt, error={
-                "code": "tick_failed",
-                "exception_type": _safe_exception_type(exc),
-            })
-            time.sleep(poll_seconds)
-            continue
+    heartbeat_stop = threading.Event()
+    heartbeat_interval = min(poll_seconds, 5.0)
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(journal, request_id, heartbeat_stop, heartbeat_interval),
+        name="vast-lease-worker-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        while True:
+            attempt = _begin_attempt(journal, request_id)
+            if attempt is None:
+                return
+            try:
+                record = supervisor.tick(request_id)
+            except Exception as exc:
+                _finish_attempt(journal, request_id, attempt, error={
+                    "code": "tick_failed",
+                    "exception_type": _safe_exception_type(exc),
+                })
+                time.sleep(poll_seconds)
+                continue
 
-        current = _finish_attempt(journal, request_id, attempt)
-        if record is None or record.get("state") in _TERMINAL_STATES or (
-            current and current.get("state") in _TERMINAL_STATES
-        ):
-            return
-        # Unresolved create outcomes stay journaled and are reconciled on each tick.
-        time.sleep(poll_seconds)
+            current = _finish_attempt(journal, request_id, attempt)
+            if record is None or record.get("state") in _TERMINAL_STATES or (
+                current and current.get("state") in _TERMINAL_STATES
+            ):
+                return
+            # Unresolved create outcomes stay journaled and are reconciled on each tick.
+            time.sleep(poll_seconds)
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=max(0.1, heartbeat_interval * 2))
 
 
 def main() -> None:
