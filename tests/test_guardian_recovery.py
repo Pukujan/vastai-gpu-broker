@@ -471,17 +471,7 @@ class FileRecoveryGuardian:
         try:
             # The unique attempt label is the recovery key when create succeeded
             # but the initiating controller died before publishing returned IDs.
-            instance_rows = self.provider.list_instances()
-            if not isinstance(instance_rows, list):
-                raise ValueError("fake provider returned a malformed instance listing")
-            rows_by_id: dict[str, dict[str, Any]] = {}
-            for row in instance_rows:
-                if not isinstance(row, dict) or not self._valid_instance_id(row.get("id")):
-                    raise ValueError("fake provider returned an instance without a valid ID")
-                iid = str(row["id"])
-                if iid in rows_by_id:
-                    raise ValueError("fake provider returned a duplicate instance ID")
-                rows_by_id[iid] = row
+            rows_by_id = self._parse_instance_listing(self.provider.list_instances())
 
             matching_attempt_ids = {
                 iid for iid, row in rows_by_id.items()
@@ -527,27 +517,7 @@ class FileRecoveryGuardian:
 
             # Complete volume inventory is required before destroying an instance
             # that may be the only attachment-to-volume discovery anchor.
-            volumes = self.provider.list_volumes()
-            if not isinstance(volumes, list):
-                raise ValueError("fake provider returned a malformed volume listing")
-            volume_rows: dict[str, dict[str, Any]] = {}
-            attachments: dict[str, set[str]] = {}
-            for row in volumes:
-                if not isinstance(row, dict):
-                    raise ValueError("fake provider returned a malformed volume row")
-                volume_id = self._volume_id(row.get("id"))
-                if volume_id is None or volume_id in volume_rows:
-                    raise ValueError("fake provider returned an invalid or duplicate volume ID")
-                raw_attachments = row.get("instances")
-                if not isinstance(raw_attachments, (list, tuple)):
-                    raise ValueError("fake provider returned a malformed volume attachment list")
-                attached_ids: set[str] = set()
-                for attached in raw_attachments:
-                    if not isinstance(attached, dict) or not self._valid_instance_id(attached.get("id")):
-                        raise ValueError("fake provider returned an invalid volume attachment")
-                    attached_ids.add(str(attached["id"]))
-                volume_rows[volume_id] = row
-                attachments[volume_id] = attached_ids
+            volume_rows, attachments = self._parse_volume_listing(self.provider.list_volumes())
 
             if not direct_volume_ids.issubset(volume_rows):
                 raise ValueError("directly reported volume is missing from complete provider inventory")
@@ -587,21 +557,19 @@ class FileRecoveryGuardian:
                     self.provider.destroy_instance(iid)
                     destroy_instances.append(iid)
 
-            after_instances = {str(row["id"]) for row in self.provider.list_instances()}
-            volumes = self.provider.list_volumes()
-            volume_rows = {str(row["id"]): row for row in volumes}
+            after_instances = set(self._parse_instance_listing(self.provider.list_instances()))
+            volume_rows, attachments = self._parse_volume_listing(self.provider.list_volumes())
             for vid in owned_volumes:
                 row = volume_rows.get(vid)
                 if row is None:
                     continue
-                attached = row.get("instances", [])
-                if attached or after_instances.intersection(owned_instances):
+                if attachments[vid] or after_instances.intersection(owned_instances):
                     continue
                 self.provider.destroy_volume(vid)
                 destroy_volumes.append(vid)
 
-            final_instances = {str(row["id"]) for row in self.provider.list_instances()}
-            final_volumes = {str(row["id"]) for row in self.provider.list_volumes()}
+            final_instances = set(self._parse_instance_listing(self.provider.list_instances()))
+            final_volumes, _ = self._parse_volume_listing(self.provider.list_volumes())
         except Exception:
             return self._pending(
                 request_id,
@@ -640,7 +608,51 @@ class FileRecoveryGuardian:
 
     @staticmethod
     def _valid_instance_id(value: Any) -> bool:
-        return not isinstance(value, bool) and isinstance(value, (str, int)) and bool(str(value).strip())
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return False
+        text = str(value)
+        return bool(text.strip()) and text == text.strip()
+
+    @classmethod
+    def _parse_instance_listing(cls, value: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(value, list):
+            raise ValueError("fake provider returned a malformed instance listing")
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for row in value:
+            if not isinstance(row, dict) or not cls._valid_instance_id(row.get("id")):
+                raise ValueError("fake provider returned an instance without a valid ID")
+            instance_id = str(row["id"])
+            if instance_id in rows_by_id:
+                raise ValueError("fake provider returned a duplicate instance ID")
+            rows_by_id[instance_id] = row
+        return rows_by_id
+
+    @classmethod
+    def _parse_volume_listing(
+        cls,
+        value: Any,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, set[str]]]:
+        if not isinstance(value, list):
+            raise ValueError("fake provider returned a malformed volume listing")
+        volume_rows: dict[str, dict[str, Any]] = {}
+        attachments: dict[str, set[str]] = {}
+        for row in value:
+            if not isinstance(row, dict):
+                raise ValueError("fake provider returned a malformed volume row")
+            volume_id = cls._volume_id(row.get("id"))
+            if volume_id is None or volume_id in volume_rows:
+                raise ValueError("fake provider returned an invalid or duplicate volume ID")
+            raw_attachments = row.get("instances")
+            if not isinstance(raw_attachments, (list, tuple)):
+                raise ValueError("fake provider returned a malformed volume attachment list")
+            attached_ids: set[str] = set()
+            for attached in raw_attachments:
+                if not isinstance(attached, dict) or not cls._valid_instance_id(attached.get("id")):
+                    raise ValueError("fake provider returned an invalid volume attachment")
+                attached_ids.add(str(attached["id"]))
+            volume_rows[volume_id] = row
+            attachments[volume_id] = attached_ids
+        return volume_rows, attachments
 
     @staticmethod
     def _volume_id(value: Any) -> str | None:
@@ -1219,6 +1231,29 @@ def test_guardian_discovers_unpublished_ambiguous_create_and_cleans_only_request
     harness.provider_truth.write(provider_state)
     harness.provider_control.set_outage(instance_listing=True)
 
+    original_destroy_instance = first.provider.destroy_instance
+    original_destroy_volume = first.provider.destroy_volume
+    published_at_destroy: list[tuple[str, str]] = []
+
+    def destroy_instance_after_publication(instance_id: str) -> dict[str, bool]:
+        durable = harness.registry().read(initial_snapshot.request_id)
+        assert durable is not None and durable.durable is True
+        assert created_id in durable.owned_instance_ids
+        assert set(created_volume_ids).issubset(durable.owned_volume_ids)
+        published_at_destroy.append(("instance", instance_id))
+        return original_destroy_instance(instance_id)
+
+    def destroy_volume_after_publication(volume_id: str) -> dict[str, bool]:
+        durable = harness.registry().read(initial_snapshot.request_id)
+        assert durable is not None and durable.durable is True
+        assert created_id in durable.owned_instance_ids
+        assert volume_id in durable.owned_volume_ids
+        published_at_destroy.append(("volume", volume_id))
+        return original_destroy_volume(volume_id)
+
+    first.provider.destroy_instance = destroy_instance_after_publication
+    first.provider.destroy_volume = destroy_volume_after_publication
+
     receipt = first.reconcile(
         request_id=initial_snapshot.request_id,
         operation_fence=initial_snapshot.operation_fence,
@@ -1228,6 +1263,10 @@ def test_guardian_discovers_unpublished_ambiguous_create_and_cleans_only_request
     assert receipt.provider_absence_confirmed is True
     assert receipt.destroy_requests_instance_ids == (created_id,)
     assert set(receipt.destroy_requests_volume_ids) == set(created_volume_ids)
+    assert published_at_destroy == [
+        ("instance", created_id),
+        *(('volume', volume_id) for volume_id in created_volume_ids),
+    ]
 
     published = harness.registry().read(initial_snapshot.request_id)
     assert published is not None
@@ -1296,6 +1335,73 @@ def test_unpublished_create_discovery_listing_failure_stays_pending_then_recover
     assert unchanged["events"] == [["create", created_id]]
 
     harness.provider_control.set_outage(instance_listing=True, volume_listing=True)
+    recovered = second.reconcile(
+        request_id=initial_snapshot.request_id,
+        operation_fence=initial_snapshot.operation_fence,
+    )
+    _assert_recovery_receipt(second, recovered, initial_snapshot.request_id, initial_snapshot.operation_fence)
+    assert recovered.state == RecoveryState.VERIFIED_ABSENT
+    final = harness.provider_truth.read()
+    assert set(final["instances"]) == {"unrelated-instance"}
+    assert set(final["volumes"]) == {"9000"}
+
+
+@pytest.mark.parametrize(
+    ("listing_kind", "malformed_call", "missing_field"),
+    [
+        ("volumes", 2, "instances"),
+        ("instances", 3, "id"),
+        ("volumes", 3, "instances"),
+        ("volumes", 3, "id"),
+    ],
+)
+def test_malformed_successful_post_destroy_listings_stay_pending_then_recover(
+    tmp_path: Path,
+    listing_kind: str,
+    malformed_call: int,
+    missing_field: str,
+) -> None:
+    harness = FileLeaseLifecycleHarness(tmp_path)
+    first, second, initial_snapshot = _run_to_unpublished_ambiguous_create(
+        harness, f"malformed-listing-{listing_kind}-{malformed_call}"
+    )
+    truth = harness.provider_truth.read()
+    created_id = next(
+        iid for iid in truth["instances"] if iid not in initial_snapshot.preexisting_instance_ids
+    )
+    created_volume_id = truth["instances"][created_id]["volume_ids"][0]
+    harness.provider_control.set_outage(instance_listing=True, volume_listing=True)
+
+    method_name = "list_instances" if listing_kind == "instances" else "list_volumes"
+    original_listing = getattr(first.provider, method_name)
+    call_count = 0
+
+    def malformed_listing() -> list[dict[str, Any]]:
+        nonlocal call_count
+        call_count += 1
+        rows = original_listing()
+        if call_count == malformed_call:
+            resource_id = created_id if listing_kind == "instances" else (
+                "9000" if malformed_call == 3 else created_volume_id
+            )
+            row = next(row for row in rows if str(row.get("id")) == resource_id)
+            row.pop(missing_field)
+        return rows
+
+    setattr(first.provider, method_name, malformed_listing)
+    pending = first.reconcile(
+        request_id=initial_snapshot.request_id,
+        operation_fence=initial_snapshot.operation_fence,
+    )
+
+    _assert_recovery_receipt(first, pending, initial_snapshot.request_id, initial_snapshot.operation_fence)
+    assert pending.state == RecoveryState.CLEANUP_PENDING
+    assert pending.provider_absence_confirmed is False
+    published = harness.registry().read(initial_snapshot.request_id)
+    assert published is not None and published.durable is True
+    assert published.owned_instance_ids == (created_id,)
+    assert published.owned_volume_ids == (created_volume_id,)
+
     recovered = second.reconcile(
         request_id=initial_snapshot.request_id,
         operation_fence=initial_snapshot.operation_fence,
