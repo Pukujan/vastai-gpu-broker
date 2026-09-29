@@ -10,11 +10,12 @@ The GitHub issue owns overall acceptance. Child issues #2–#4 cover research, m
 
 - Planning contracts created: `SPEC.md`, `docs/PDD.md`, `docs/SDD.md`, `docs/TDD.md`.
 - Luna builders dispatched on child issues #2–#4.
-- Owner hourly/total/runtime/network/bid limits are not recorded; paid create must remain blocked until available.
+- One on-demand Open-Jev 9B run completed on an RTX 3090. Six inference requests passed over 184.1 seconds, and provider inventories showed no remaining instance or volume after teardown. See the [sanitized run report](../docs/evidence/openjev-9b-live-run-2026-09-29.md).
+- The normal broker create path still needs two deployed cleanup services and their shared registry. Multi-model placement, bid-race coordination, guardian failure injection, and the private evaluator remain open.
 
 ## Next checkpoint
 
-Integrate and validate builder modules; update this record with actual test and merge evidence before the fresh-agent challenge.
+Publish the live-run report, local Vast API/usage guide, and current checkpoint through the required `gates` PR path. Then continue the remaining guardian and multi-model acceptance work.
 
 
 ## Checkpoint log

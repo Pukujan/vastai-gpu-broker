@@ -4,11 +4,13 @@ This repository is public. Treat all committed files, issues, workflow logs, and
 
 This repository contains a Python package for evidence-first model hosting decisions and temporary Vast.ai GPU leases. It can query current offers, validate supplied model evidence, compare costs under explicit limits, and includes a lease controller with a durable local journal and an independent cleanup supervisor.
 
-**The paid Open-Jev run is still blocked.** The `create` command refreshes the offer through the router, binds the pinned 9B recipe and limits, and records inference and cleanup evidence. It stops before creation unless scoped Vast credentials, finite owner limits, and two deployed cleanup paths backed by one shared registry are configured. The repository includes the recovery service and GitHub Actions adapters, but they have not been deployed or tested across real failure domains. No real Vast inference or cleanup challenge is claimed as tested.
+**The Open-Jev 9B live challenge passed on 2026-09-29.** One on-demand RTX 3090 with 24 GB of VRAM loaded the Open-Jev adapter on Qwen3.5-9B. Six inference requests succeeded over 184.1 seconds, then fresh Vast inventories showed no remaining instance or volume. The host was marked unverified, and the inference endpoint listened on the rented machine's loopback address. [Read the sanitized run record](docs/evidence/openjev-9b-live-run-2026-09-29.md).
+
+The repository's normal paid `create` path still requires two deployed cleanup services and their shared registry. The live challenge proves this one model run and teardown; it does not establish that those recovery services work across separate failure domains.
 
 ## Install and adopt
 
-Requirements: Python 3.11 or newer. The package declares no runtime third-party dependencies.
+Requirements: Python 3.11 or newer. The package declares no runtime third-party dependencies. For official Vast API and SDK links, local setup, credentials, and use from another project, see [local usage and API references](docs/local-usage-and-api.md).
 
 ```powershell
 python -m pip install -e .
@@ -115,7 +117,7 @@ The command can report `OPENJEV_LIVE_TEST_PASSED` only when the pinned server re
 | --- | --- | --- |
 | `vast-broker search` (`offers`) / `search_offers()` | Read-only live marketplace search | Available; requires configured Vast read access. |
 | `vast-broker route` / `route_request()` | Read-only evidence, selection, quote, and limit routing | Available; returns a next action/proposal or a blocker. It does not create an instance. |
-| `vast-broker create` (`run-openjev`) | Fresh routing, one pinned 9B inference, and verified teardown | Wired into the router and lease controller; fail-closed until two deployed cleanup paths, their shared registry, and owner limits are configured. No paid run has completed. |
+| `vast-broker create` (`run-openjev`) | Fresh routing, one pinned 9B inference, and verified teardown | The normal command stays fail-closed until two cleanup paths and their shared registry are deployed and ready. One live Open-Jev challenge passed; see the [run record](docs/evidence/openjev-9b-live-run-2026-09-29.md). |
 | `vast-broker status REQUEST_ID` | Refresh the status of one journaled lease and its owned resources | Read-only; requires the scoped lease key and private journal. |
 | `vast-broker destroy REQUEST_ID` | Destroy and verify all resources owned by one journaled request | Destruction only; refuses arbitrary or untracked Vast IDs. |
 | `authorize_run()` | Calls `LeaseController.run()` after checking a confirmed proposal against the supplied plan | Used by `run-openjev`; direct Python callers must provide the same fresh proposal and exact plan bindings. |
@@ -137,10 +139,10 @@ The HTTP worker and GitHub backup path need separate deployments and scoped secr
 
 ## Current blockers and evidence
 
-- The Open-Jev CLI has a source-pinned installation and inference recipe. The recovery service and GitHub Actions adapter are implemented, but neither is deployed and physical failure-domain recovery has not been tested.
+- The Open-Jev CLI has a source-pinned installation and inference recipe. One real model run and teardown passed, as recorded in the [live run report](docs/evidence/openjev-9b-live-run-2026-09-29.md). The recovery service and GitHub Actions adapter are not deployed, so recovery across failure domains remains untested.
 - The CLI `route` command consumes supplied request, evidence, market, and limit files; automatic research capture and an end-to-end fresh-plan-and-confirm loop are not provided.
 - The Python lease/provider APIs can create resources outside `authorize_run` when directly invoked, so safe use depends on the adopter calling the router gate first.
-- Existing automated lifecycle tests use fakes. No paid model install, real inference, provider spend cap, or real Vast cleanup challenge is claimed as tested.
+- Existing automated lifecycle tests use fakes. The live challenge establishes one successful model install, inference, and provider-side teardown; it does not establish a provider-enforced spend cap or recovery by deployed guardians.
 - Local deadlines and cleanup retries cannot guarantee provider action during total controller/network/provider failure, and quotes do not guarantee future availability or final charges.
 - The checkpoint is the source of current acceptance and release status. If it disagrees with the code state, resolve and update that checkpoint through the repository's reviewed progression before claiming readiness.
 
