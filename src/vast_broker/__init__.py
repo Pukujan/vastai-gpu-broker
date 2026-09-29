@@ -9,6 +9,8 @@ from .guardians import (
 )
 from .lease import LeaseController, LeaseError, LeaseProvider, LeaseSupervisor
 from .process_supervisor import ProcessLeaseSupervisor
+from .r2_registry import R2RegistryError, R2SharedLeaseRegistry
+from .rentai import VastRentaiService
 from .market import search_offers
 from .provider import VastAPIError, VastOffersClient
 from .openjev import (
@@ -20,7 +22,8 @@ from .router import authorize_run, candidate_key, review_candidate, route_reques
 __all__ = [
     "JournalError", "LeaseJournal", "LeaseController", "LeaseError", "LeaseProvider",
     "LeaseSupervisor", "ProcessLeaseSupervisor", "GuardianKind", "RecoveryState",
-    "VastAPIError", "VastOffersClient", "search_offers",
+    "VastAPIError", "VastOffersClient", "VastRentaiService", "search_offers",
+    "R2RegistryError", "R2SharedLeaseRegistry",
     "GuardianCapabilities", "GuardianDescriptor", "LeaseCreateIntent", "FenceReservation",
     "GuardianAck", "LeaseRegistrySnapshot", "GuardianReadinessReceipt",
     "GuardianRecoveryReceipt", "GuardianReadinessError", "GuardianReadinessGate",

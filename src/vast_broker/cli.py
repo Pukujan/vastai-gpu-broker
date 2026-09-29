@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import importlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -14,10 +13,9 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from .market import search_offers
 from .provider import VastOffersClient
 from .journal import LeaseJournal
-from .lease import LeaseController, LeaseError
+from .lease import LeaseError
 from .openjev import (
     OPENJEV_MODEL_REPOSITORY,
     OPENJEV_MODEL_REVISION,
@@ -28,8 +26,9 @@ from .openjev import (
     validate_health_response,
     validate_probe_response,
 )
+from .rentai import VastRentaiService
 from .research import resolve_request
-from .router import authorize_run, candidate_key, route_request
+from .router import candidate_key, route_request
 
 
 def _read_json(path: str) -> Any:
@@ -237,9 +236,10 @@ def _run_openjev(args: argparse.Namespace) -> int:
 
     read_client = VastOffersClient(api_key=search_key)
     lease_client = VastOffersClient(api_key=lease_key)
+    search_service = VastRentaiService(search_client=read_client)
 
     def search_current(constraints: Any, requested_disk: float | int | None) -> dict[str, Any]:
-        return search_offers(constraints, client=read_client, disk_gb=requested_disk)
+        return search_service.search(constraints, disk_gb=requested_disk)
 
     route = route_request(request, evidence_by_candidate=evidence, limits=limits,
                           offer_searcher=search_current,
@@ -258,7 +258,10 @@ def _run_openjev(args: argparse.Namespace) -> int:
         raise ValueError("Open-Jev runner requires its pinned Vast lifecycle provider factory")
     os.environ["VAST_BROKER_PROVIDER_FACTORY"] = required_provider_factory
     journal = LeaseJournal(journal_dir)
-    controller = LeaseController(lease_client, journal, guardian_gate=_load_factory(gate_factory))
+    service = VastRentaiService(
+        provider=lease_client, search_client=read_client, journal=journal,
+        guardian_gate=_load_factory(gate_factory),
+    )
     request_id = str(route["request_id"])
     if journal.load(request_id) is not None:
         _write_json(_trial_report(route, None, None), args.output)
@@ -267,11 +270,10 @@ def _run_openjev(args: argparse.Namespace) -> int:
     failure: BaseException | None = None
     lease: dict[str, Any] | None = None
     try:
-        lease = authorize_run(
+        lease = service.create(
             proposal,
             route["proposal_digest"],
             current_proposal=proposal,
-            lease_controller=controller,
             plan=plan,
             operation=OpenJevTrialOperation(lease_client),
         )
@@ -294,127 +296,26 @@ def _lease_journal() -> LeaseJournal:
     return LeaseJournal(journal_dir)
 
 
-def _owned_resource_ids(record: dict[str, Any], field: str) -> list[str]:
-    values = record.get(field)
-    absence = record.get("absence_evidence")
-    if not isinstance(values, list) or not values:
-        values = absence.get(field) if isinstance(absence, dict) else []
-    return sorted({str(value) for value in values if isinstance(value, (str, int)) and str(value)})
-
-
-def _safe_provider_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Expose lifecycle facts without leaking connection details or env values."""
-    safe: dict[str, Any] = {}
-    for key in ("id", "actual_status", "status", "state", "label", "gpu_name", "dph_total", "start_date"):
-        value = row.get(key)
-        if (isinstance(value, (str, int, bool))
-                or isinstance(value, float) and math.isfinite(value)):
-            safe[key] = value
-    return safe
-
-
-def _lease_status_payload(
-    record: dict[str, Any],
-    instances: list[dict[str, Any]] | None,
-    volumes: list[dict[str, Any]] | None,
-) -> dict[str, Any]:
-    instance_ids = _owned_resource_ids(record, "owned_instance_ids")
-    volume_ids = _owned_resource_ids(record, "owned_volume_ids")
-    present_instances = []
-    present_volumes = []
-    if instances is not None:
-        present_instances = [
-            _safe_provider_row(row) for row in instances
-            if str(row.get("id")) in instance_ids
-        ]
-    if volumes is not None:
-        present_volumes = [
-            _safe_provider_row(row) for row in volumes
-            if str(row.get("id")) in volume_ids
-        ]
-    instance_absence = (
-        not present_instances if instances is not None and instance_ids else None
-    )
-    volume_absence = (
-        not present_volumes if volumes is not None else None
-    ) if not volume_ids else (
-        not present_volumes if volumes is not None else None
-    )
-    cleanup_verified = (
-        record.get("state") in {"DESTROYED", "FAILED_CLEAN"}
-        and instance_absence is True
-        and volume_absence is True
-    )
-    absence = record.get("absence_evidence")
-    return {
-        "request_id": record.get("request_id"),
-        "state": record.get("state"),
-        "owned_instance_ids": instance_ids,
-        "owned_volume_ids": volume_ids,
-        "instance_inventory_complete": instances is not None,
-        "volume_inventory_complete": volumes is not None,
-        "owned_instances_absent": instance_absence,
-        "owned_volumes_absent": volume_absence,
-        "cleanup_verified": cleanup_verified,
-        "instances": present_instances,
-        "volumes": present_volumes,
-        "operation_result_state": (
-            record.get("operation_result", {}).get("state")
-            if isinstance(record.get("operation_result"), dict) else None
-        ),
-        "last_verified_absent_at_utc": (
-            record.get("confirmed_absent_at_utc")
-            if isinstance(absence, dict) or record.get("confirmed_absent_at_utc") else None
-        ),
-    }
-
-
-def _read_owned_inventory(client: VastOffersClient) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
-    """Read both complete account inventories; a failed read never means absent."""
-    instances: list[dict[str, Any]] | None = None
-    volumes: list[dict[str, Any]] | None = None
-    try:
-        instances = client.list_instances()
-    except Exception:
-        pass
-    try:
-        volumes = client.list_volumes()
-    except Exception:
-        pass
-    return instances, volumes
-
-
 def _status_request(args: argparse.Namespace) -> int:
     journal = _lease_journal()
-    record = journal.load(args.request_id)
-    if record is None:
-        _write_json({"request_id": args.request_id, "state": "NOT_FOUND"}, args.output)
+    if journal.load(args.request_id) is None:
+        result = {"request_id": args.request_id, "state": "NOT_FOUND"}
+        _write_json(result, args.output)
         return 2
-    client = lease_provider_factory()
-    instances, volumes = _read_owned_inventory(client)
-    result = _lease_status_payload(record, instances, volumes)
+    service = VastRentaiService(provider=lease_provider_factory(), journal=journal)
+    result = service.status(args.request_id)
     _write_json(result, args.output)
-    return 0 if instances is not None and volumes is not None else 1
+    return 0 if result["instance_inventory_complete"] and result["volume_inventory_complete"] else 1
 
 
 def _destroy_request(args: argparse.Namespace) -> int:
     journal = _lease_journal()
-    record = journal.load(args.request_id)
-    if record is None:
-        _write_json({"request_id": args.request_id, "state": "NOT_FOUND", "destroyed": False}, args.output)
+    if journal.load(args.request_id) is None:
+        result = {"request_id": args.request_id, "state": "NOT_FOUND", "destroyed": False}
+        _write_json(result, args.output)
         return 2
-    client = lease_provider_factory()
-    controller = LeaseController(client, journal)
-    try:
-        record = controller.cancel(args.request_id) or journal.load(args.request_id) or record
-    except LeaseError as exc:
-        record = exc.result or journal.load(args.request_id) or record
-    except Exception as exc:
-        print(f"vast-broker: destroy failed ({type(exc).__name__})", file=sys.stderr)
-        record = journal.load(args.request_id) or record
-    instances, volumes = _read_owned_inventory(client)
-    result = _lease_status_payload(record, instances, volumes)
-    result["destroyed"] = result["cleanup_verified"]
+    service = VastRentaiService(provider=lease_provider_factory(), journal=journal)
+    result = service.destroy(args.request_id)
     _write_json(result, args.output)
     return 0 if result["destroyed"] else 1
 
@@ -480,8 +381,9 @@ def main(argv: list[str] | None = None) -> int:
             filters = _read_json(args.filters) if args.filters else {}
             if not isinstance(filters, dict):
                 raise ValueError("filters file must contain a JSON object")
-            result = search_offers(filters, client=VastOffersClient(), page_size=args.page_size,
-                                   max_pages=args.max_pages, disk_gb=args.disk_gb)
+            result = VastRentaiService(search_client=VastOffersClient()).search(
+                filters, page_size=args.page_size, max_pages=args.max_pages, disk_gb=args.disk_gb,
+            )
             _write_json(result, args.output)
             return 0
         if args.command in {"run-openjev", "create"}:
