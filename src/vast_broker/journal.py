@@ -1,11 +1,13 @@
 """Durable local lease journal with request-scoped process locks."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +16,25 @@ from typing import Any, Iterator
 
 class JournalError(RuntimeError):
     """A lease obligation could not be durably recorded or read."""
+
+
+def _acquire_windows_lock(handle: Any, msvcrt_module: Any | None = None, *,
+                          sleep_fn: Any = time.sleep) -> None:
+    """Wait for the journal byte lock, retrying only Windows lock contention."""
+    if msvcrt_module is None:
+        import msvcrt as msvcrt_module
+
+    while True:
+        handle.seek(0, os.SEEK_SET)
+        try:
+            # LK_NBLCK fails immediately with EACCES when another process holds
+            # the byte; unlike LK_LOCK, it has no built-in ten-attempt limit.
+            msvcrt_module.locking(handle.fileno(), msvcrt_module.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if exc.errno != errno.EACCES:
+                raise
+            sleep_fn(0.05)
 
 
 def _json_default(value: Any) -> Any:
@@ -73,8 +94,7 @@ class LeaseJournal:
                         handle.seek(0, os.SEEK_SET)
                         handle.write(b"0")
                         handle.flush()
-                    handle.seek(0, os.SEEK_SET)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    _acquire_windows_lock(handle, msvcrt)
                     try:
                         depths[key] = 1
                         self._depth.values = depths
