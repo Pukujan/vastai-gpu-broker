@@ -27,9 +27,9 @@ Optional tuning: `VAST_BROKER_GUARDIAN_BIND` (defaults to `0.0.0.0`), `PORT` (de
 
 ## Second path on GitHub Actions
 
-`.github/workflows/vast-guardian.yml` is a slower second recovery path alongside the persistent service. It uses the trusted `main` workflow code, runs a five-minute schedule and can be dispatched for an intent acknowledgement or immediate reconciliation. It is disabled unless the repository variable `VAST_BROKER_GUARDIAN_ENABLED` is exactly `true`.
+`.github/workflows/vast-guardian.yml` is a slower second recovery path alongside the persistent service. It uses the trusted `main` workflow code, runs a five-minute schedule and can be dispatched for an intent acknowledgement or immediate reconciliation. It is disabled unless the repository variable `VAST_BROKER_GUARDIAN_ENABLED` is exactly `true`, and its secret-bearing job runs only in a private repository. This broker's source repository is public. Do not add Vast or R2 credentials there; use a private owner-controlled repository for this path, or configure two private HTTP services instead. Repository writers can read workflow secrets, so the Vast key must have only `misc`, `instance_read`, and `instance_write` scopes. [GitHub's secret guidance](https://docs.github.com/en/actions/reference/security/secure-use) states that anyone with repository write access can read configured secrets.
 
-Configure these GitHub Actions secrets only after creating narrowly scoped credentials for this recovery purpose:
+In that private repository, configure these GitHub Actions secrets only after creating narrowly scoped credentials for this recovery purpose:
 
 - `VAST_BROKER_GITHUB_VAST_API_KEY`
 - `VAST_BROKER_R2_BUCKET`
