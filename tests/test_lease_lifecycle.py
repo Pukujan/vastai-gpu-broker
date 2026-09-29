@@ -587,6 +587,29 @@ def test_delete_acknowledgement_is_not_absence_and_reconcile_retries(tmp_path):
     assert not provider.instances
 
 
+
+def test_operation_activity_hook_marks_ready_under_the_controller(tmp_path):
+    provider = FakeProvider()
+    journal = LeaseJournal(tmp_path)
+    captured = {}
+
+    class BoundOperation:
+        def bind_activity(self, hook):
+            captured["hook"] = hook
+
+        def __call__(self, instance):
+            assert callable(captured["hook"])
+            record = captured["hook"]()
+            assert record["state"] == "READY"
+            assert record["ready_epoch"]
+            return "ok"
+
+    LeaseController(provider, journal, FakeSupervisor(),
+                    guardian_gate=FakeGuardianGate()).run("hook-ready", plan(), BoundOperation())
+    assert "hook" in captured
+    saved = journal.load("hook-ready")
+    assert saved["ready_epoch"] and saved["last_inference_epoch"]
+
 def test_callback_failure_cancel_and_replayed_cleanup_converge_without_a_second_create(tmp_path):
     provider = FakeProvider()
     ctl = controller(tmp_path, provider)

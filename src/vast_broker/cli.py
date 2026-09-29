@@ -19,9 +19,14 @@ from .lease import LeaseError
 from .openjev import (
     OPENJEV_MODEL_REPOSITORY,
     OPENJEV_MODEL_REVISION,
+    LIVE_WINDOW_ATTEMPTS,
+    LIVE_WINDOW_INTERVAL_SECONDS,
+    LIVE_WINDOW_MAX_FAILURES,
+    LIVE_WINDOW_SECONDS,
     OpenJevTrialOperation,
     deployment_recipe,
     lease_plan_from_proposal,
+    trial_limit_floor_errors,
     trial_steps,
     validate_health_response,
     validate_probe_response,
@@ -141,12 +146,24 @@ def _trial_report(route: dict[str, Any], lease: dict[str, Any] | None,
         )
     except (KeyError, TypeError, ValueError, UnicodeEncodeError):
         pass
+    window = result.get("live_window")
+    window_ok = (
+        isinstance(window, dict)
+        and window.get("attempts") == LIVE_WINDOW_ATTEMPTS
+        and window.get("max_allowed_failures") == LIVE_WINDOW_MAX_FAILURES
+        and window.get("interval_seconds") == LIVE_WINDOW_INTERVAL_SECONDS
+        and window.get("window_seconds") == LIVE_WINDOW_SECONDS
+        and isinstance(window.get("failures"), int)
+        and not isinstance(window.get("failures"), bool)
+        and 0 <= window["failures"] <= LIVE_WINDOW_MAX_FAILURES
+    )
     inference_ok = (
         result.get("state") == "inference_verified"
         and result.get("instance_id") == str(instance_id)
         and result_digest_matches
         and response_valid
         and step_receipts_valid
+        and window_ok
         and isinstance(plan, dict)
         and plan.get("proposal_digest") == route.get("proposal_digest")
     )
@@ -176,6 +193,7 @@ def _trial_report(route: dict[str, Any], lease: dict[str, Any] | None,
             "choice": result.get("choice"),
             "probabilities": result.get("probabilities"),
             "model_identity": result.get("model_identity"),
+            "live_window": window,
             "response_sha256": result.get("response_sha256"),
         } if inference_ok else None),
         "operation_result_sha256": record.get("operation_result_sha256") if isinstance(record, dict) else None,
@@ -206,6 +224,11 @@ def _run_openjev(args: argparse.Namespace) -> int:
         }
         _write_json(blocked, args.output)
         return 2
+    below_floor = trial_limit_floor_errors(limits)
+    if below_floor:
+        raise ValueError("Open-Jev caps conflict with the pinned trial window: "
+                         + ", ".join(below_floor))
+
     search_key = os.environ.get("VAST_BROKER_SEARCH_API_KEY")
     lease_key = os.environ.get("VAST_BROKER_LEASE_API_KEY")
     if not search_key or not lease_key:

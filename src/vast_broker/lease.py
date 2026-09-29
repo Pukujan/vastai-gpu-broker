@@ -573,6 +573,9 @@ class LeaseController:
         active_instance: dict[str, Any] = dict(instance)
         try:
             active_instance = self._await_started(request_id)
+            bind_activity = getattr(operation, "bind_activity", None)
+            if callable(bind_activity):
+                bind_activity(lambda: self.record_activity(request_id, inference_completed=True))
             result = operation(dict(active_instance))
             self._persist_operation_result(request_id, result)
         except BaseException as exc:
