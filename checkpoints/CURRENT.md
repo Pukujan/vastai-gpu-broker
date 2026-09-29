@@ -71,6 +71,14 @@ Canonical task: [VBR-0001 / issue #1](https://github.com/Pukujan/vastai-gpu-brok
 - The current working change fixes standalone CLI search to use the documented scoped read key and exposes rental-type selection. CLI lifecycle/search tests pass (10 tests); the complete suite passes (226 tests), `python -m compileall -q src tests` passes, `continuity validate --root .` returns `VALID`, and `git diff --check` passes. These checks use fakes and local help output; they make no live Vast API or GPU-run claim.
 - A session should rent one GPU for the requested model/benchmark bundle, switch or co-reside models according to the explicit workload mode, then destroy the ephemeral instance. Keeping an on-demand GPU permanently rented only makes sense after measured utilization and current offers justify its idle-hour cost.
 
+## Owner-directed Open-Jev portability smoke
+
+On 2026-09-29, a context-isolated subagent used an isolated install of the broker to run a read-only on-demand search for one GPU with at least 24 GB memory and a $0.20/hour ceiling. The single page returned 100 offers and was marked incomplete. No create command ran, and this smoke created no GPU instance or charge. The owner authorized one Open-Jev 9B run capped at $0.20 total and $0.20/hour all-in, with network around $1–2/TB, at least three minutes of live inference, and verified destruction afterward. The raw search result and API credential remain local; resume instructions are in [the portability smoke checkpoint](openjev-portability-smoke-2026-09-29.md).
+
+The run found that `search --filters` needs a JSON file path, though its help previously suggested an inline JSON object. The help now explains the required file and the flags that control rental type, pagination, and marketplace status. The latest broker checkpoint still lacks two deployed recovery guardians and a shared registry, so paid creation remains fail-closed until those services are verified. Continue with a fresh search and the guarded lifecycle after the owner switches devices; do not request the already-granted spend authorization again.
+
+The earlier projectless Codex task received a stop instruction after repeated local-file approval prompts; its thread still shows the pending gate. A context-isolated subagent completed the read-only search and was then stopped for the device handoff. The paused projectless task has no create receipt and must not be resumed as a second run.
+
 ## Next action
 
 The next product action is to deploy and test two cleanup services in separate failure domains against the shared registry. Keep `create` fail-closed until both paths can reconcile the same fenced lease record and verify provider-side absence. Other repository sessions can install a reviewed commit using [the local usage guide](../docs/local-usage-and-api.md). No approving reviewer is required; future changes still need the `gates` check.

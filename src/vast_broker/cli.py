@@ -333,7 +333,13 @@ def _parser() -> argparse.ArgumentParser:
 
     search = commands.add_parser("search", aliases=["offers"],
                                  help="perform a read-only live marketplace search")
-    search.add_argument("--filters", help="optional JSON object of documented offer constraints")
+    search.add_argument(
+        "--filters",
+        help=(
+            "path to a JSON file with offer constraints; rental type, pagination, "
+            "and marketplace status are controlled by this command"
+        ),
+    )
     search.add_argument("--disk-gb", type=float, help="disk allocation used for price statistics")
     search.add_argument("--page-size", type=int, default=100)
     search.add_argument("--max-pages", type=int, default=20)

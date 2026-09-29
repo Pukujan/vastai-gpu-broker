@@ -57,6 +57,14 @@ def test_search_and_offers_aliases_share_identical_search_arguments():
     assert {**search, "rental_type": None} == offers
 
 
+def test_search_help_explains_filter_file_and_cli_managed_fields():
+    parser = cli._parser()
+    subparsers = next(action for action in parser._actions if hasattr(action, "choices") and action.choices)
+    help_text = " ".join(subparsers.choices["search"].format_help().split())
+    assert "path to a JSON file" in help_text
+    assert "rental type, pagination, and marketplace status are controlled" in help_text
+
+
 def test_search_uses_scoped_key_and_exposes_rental_type_filter(monkeypatch, capsys):
     observed = {}
 
