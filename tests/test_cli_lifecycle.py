@@ -50,11 +50,37 @@ def _saved_lease(journal_dir, request_id="trial-1", instance_id="42"):
 
 def test_search_and_offers_aliases_share_identical_search_arguments():
     parser = cli._parser()
-    search = vars(parser.parse_args(["search", "--page-size", "7"]))
+    search = vars(parser.parse_args(["search", "--page-size", "7", "--rental-type", "ondemand"]))
     offers = vars(parser.parse_args(["offers", "--page-size", "7"]))
     search.pop("command")
     offers.pop("command")
-    assert search == offers
+    assert {**search, "rental_type": None} == offers
+
+
+def test_search_uses_scoped_key_and_exposes_rental_type_filter(monkeypatch, capsys):
+    observed = {}
+
+    class SearchClient:
+        def __init__(self, *, api_key):
+            observed["api_key"] = api_key
+
+    class SearchService:
+        def __init__(self, *, search_client):
+            observed["client"] = search_client
+
+        def search(self, filters, **kwargs):
+            observed.update(filters=filters, **kwargs)
+            return {"offers": []}
+
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
+    monkeypatch.setenv("VAST_BROKER_SEARCH_API_KEY", "read-only-test-key")
+    monkeypatch.setattr(cli, "VastOffersClient", SearchClient)
+    monkeypatch.setattr(cli, "VastRentaiService", SearchService)
+
+    assert cli.main(["search", "--rental-type", "ondemand", "--rental-type", "bid"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"offers": []}
+    assert observed["api_key"] == "read-only-test-key"
+    assert observed["rental_types"] == ("ondemand", "bid")
 
 
 def test_create_and_run_openjev_aliases_use_the_same_guarded_runner(monkeypatch):

@@ -25,7 +25,7 @@ For another project, pin this repository to a reviewed commit and follow [checkp
 
 ## Refresh current offers
 
-`offers` performs a live, read-only query at invocation time. Configure `VAST_API_KEY` through the local secret store or process environment using a read-only key with the Vast `misc` permission. Never put the value in command arguments, request files, logs, or the repository.
+`search` (`offers` alias) performs a live, read-only query at invocation time. Configure `VAST_BROKER_SEARCH_API_KEY` through the local secret store or process environment using a read-only key with the Vast `misc` permission. The legacy `VAST_API_KEY` is accepted as a fallback. Never put the value in command arguments, request files, logs, or the repository. Repeat `--rental-type` to select `ondemand`, `bid`, or `reserved`; the default searches all three.
 
 ```powershell
 vast-broker offers --disk-gb 100 --output current-offers.json
