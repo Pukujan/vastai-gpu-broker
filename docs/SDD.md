@@ -20,6 +20,8 @@ Target commands:
 | `status` | Inspect request/lease/research/cleanup status. | None |
 | `reconcile` | Recover and destroy owned unresolved or expired leases. | Destruction only |
 
+The CLI also exposes the provider lifecycle verbs `search`, `create`, `status`, and `destroy`. `search` aliases `offers`; `create` aliases the bounded `run-openjev` flow and always passes through fresh routing, authorization, supervision, and verified cleanup. `status REQUEST_ID` refreshes instance and volume inventories for resources in that request's private journal. `destroy REQUEST_ID` cancels and cleans up only that request's journaled resources, then verifies provider-side absence. The commands do not accept arbitrary offer or instance IDs as a way around the router and ownership journal.
+
 The module never silently fills a missing task budget. Owner policy can provide explicit reusable defaults with provenance; the route must expose their source and effective values. Credential presence alone is not payment authorization.
 
 ## Data contracts

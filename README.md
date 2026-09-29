@@ -4,7 +4,7 @@ This repository is public. Treat all committed files, issues, workflow logs, and
 
 This repository contains a Python package for evidence-first model hosting decisions and temporary Vast.ai GPU leases. It can query current offers, validate supplied model evidence, compare costs under explicit limits, and includes a lease controller with a durable local journal and an independent cleanup supervisor.
 
-**A paid model run is not ready for adoption.** The CLI currently exposes only the read-only `offers` and `route` commands. There is no end-to-end CLI command that gathers evidence, builds and reviews the deployment recipe, refreshes and confirms the proposal, then invokes a trusted install/inference operation. Python APIs can create instances if called through the intended authorization path, and low-level provider/controller methods can also be called directly. Treat those paid-capable APIs as implementation components, not as a supported, safe model-running workflow. No paid model install or real Vast inference/cleanup challenge is claimed as tested.
+**The paid Open-Jev run is still blocked.** A `run-openjev` command now refreshes the offer through the router, binds the pinned 9B recipe and limits, and records the inference receipt and full-inventory cleanup evidence. It stops before creation unless scoped Vast credentials, finite owner limits, and a gate factory backed by two deployed cleanup paths and their shared registry are configured. This repository does not yet include those production recovery backends. No real Vast inference or cleanup challenge is claimed as tested.
 
 ## Install and adopt
 
@@ -60,13 +60,42 @@ For an ambiguous family or base-only request, research and compare exact candida
 
 `owner-limits.json` must provide finite concrete hourly, total, runtime, network, disk, start-deadline, cold-start, idle, and hung-request limits. Bid routes also need a per-machine-hour bid cap, increment, and attempt count. The router does not infer missing caps from account balance or credentials. The offer quote, chosen artifact, evidence, recipe, and limits must remain bound together; changes require fresh planning and, when needed, reconfirmation.
 
+## One Open-Jev 9B trial
+
+The trial command is restricted to the pinned Open-Jev 9B adapter and Qwen base revisions. It enforces the owner's `$0.20/hour` all-in ceiling, searches for on-demand offers only, and blocks when any required total, runtime, or network limit is missing. Configure separate local `VAST_BROKER_SEARCH_API_KEY` (`misc`) and `VAST_BROKER_LEASE_API_KEY` (`misc`, `instance_read`, `instance_write`) secrets, a private journal directory, a control-host ID, and a guardian factory that connects two deployed recovery paths to their shared durable registry. Do not place key values in command arguments or report files.
+
+```powershell
+vast-broker create `
+  --request request.json `
+  --evidence evidence-by-candidate.json `
+  --limits owner-limits.json `
+  --proposal-output trial-proposal.json `
+  --output trial-result.json
+```
+
+`create` is the first-class name for the bounded Open-Jev operation; `run-openjev` remains an alias. It searches again at invocation time, applies the router and spend gates, runs the pinned inference, then requests and verifies teardown. It does not expose a raw offer-ID create that bypasses those checks.
+
+Use the request ID from the input request to inspect or clean up that broker-owned lease:
+
+```powershell
+vast-broker status your-request-id
+vast-broker destroy your-request-id
+```
+
+`status` refreshes the full Vast instance and volume inventories and shows only resources owned by that request. `destroy` acts only on IDs recorded in the private broker journal, then verifies provider-side absence; it rejects untracked IDs. `search` performs the same live read-only offer query as the `offers` alias.
+
+The command can report `OPENJEV_LIVE_TEST_PASSED` only when the pinned server returns a valid choice distribution and the same attempt's fresh complete Vast instance inventory plus volume listing confirm that all owned resources are absent. A passing test suite or a blocked command is not a completed GPU challenge.
+
 ## Read-only and paid-capable entry points
 
 | Entry point | Effect | Current use |
 | --- | --- | --- |
-| `vast-broker offers` / `search_offers()` | Read-only live marketplace search | Available; requires configured Vast read access. |
+| `vast-broker search` (`offers`) / `search_offers()` | Read-only live marketplace search | Available; requires configured Vast read access. |
 | `vast-broker route` / `route_request()` | Read-only evidence, selection, quote, and limit routing | Available; returns a next action/proposal or a blocker. It does not create an instance. |
-| `authorize_run()` | Calls `LeaseController.run()` after checking a confirmed proposal against the supplied plan | Paid-capable Python API; not wired to a supported end-user CLI workflow. It requires a confirmed deployment recipe and exact plan bindings. |
+| `vast-broker create` (`run-openjev`) | Fresh routing, one pinned 9B inference, and verified teardown | Wired into the router and lease controller; fail-closed until two deployed cleanup paths, their shared registry, and owner limits are configured. No paid run has completed. |
+| `vast-broker status REQUEST_ID` | Refresh the status of one journaled lease and its owned resources | Read-only; requires the scoped lease key and private journal. |
+| `vast-broker destroy REQUEST_ID` | Destroy and verify all resources owned by one journaled request | Destruction only; refuses arbitrary or untracked Vast IDs. |
+| `authorize_run()` | Calls `LeaseController.run()` after checking a confirmed proposal against the supplied plan | Used by `run-openjev`; direct Python callers must provide the same fresh proposal and exact plan bindings. |
 | `LeaseController.run()` / provider `create_instance()` | Creates/manages a Vast instance | Low-level paid-capable APIs. Direct use can bypass router authorization; do not call them directly for an agent task. |
 
 `READY_TO_RUN` is a routing/proposal result, not evidence that an instance was created or a model was installed. The intended Python paid transition is `authorize_run`; it calls the lease controller only after checking the proposal digest, freshness, offer ID/type, deadlines, bid and spend terms, disk/network allowance, artifact identity, recipe digest, image, and exact create parameters. The caller remains responsible for rebuilding `current_proposal` from a genuinely fresh offer/evidence query and supplying a trusted, bounded operation. There is no packaged generic model installer or inference probe; do not execute commands copied from model cards or offer descriptions.
@@ -83,7 +112,7 @@ Deadlines and cost calculations are local controls and estimates. Vast does not 
 
 ## Current blockers and evidence
 
-- There is no supported, complete paid-run command or built-in model-specific installation/inference recipe.
+- The Open-Jev CLI has a source-pinned installation and inference recipe, but the required production recovery backends and their failure-injection proof are not implemented or deployed.
 - The CLI `route` command consumes supplied request, evidence, market, and limit files; automatic research capture and an end-to-end fresh-plan-and-confirm loop are not provided.
 - The Python lease/provider APIs can create resources outside `authorize_run` when directly invoked, so safe use depends on the adopter calling the router gate first.
 - Existing automated lifecycle tests use fakes. No paid model install, real inference, provider spend cap, or real Vast cleanup challenge is claimed as tested.

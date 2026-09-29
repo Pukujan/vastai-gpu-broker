@@ -346,7 +346,8 @@ def route_request(request: Mapping[str, Any], *, evidence_by_candidate: Mapping[
                   market: Mapping[str, Any] | None = None, limits: Mapping[str, Any] | None = None,
                   offer_searcher: Callable[[Mapping[str, Any], float | int | None], Mapping[str, Any]] | None = None,
                   fetcher: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
-                  now_utc: datetime | None = None) -> dict[str, Any]:
+                  now_utc: datetime | None = None,
+                  allowed_rental_types: Sequence[str] | None = None) -> dict[str, Any]:
     """Advance a hosting request through research, quote, confirmation and caps.
 
     Market input must be a current normalized result from ``search_offers``.
@@ -354,6 +355,16 @@ def route_request(request: Mapping[str, Any], *, evidence_by_candidate: Mapping[
     advisory until :func:`authorize_run` revalidates it immediately before the
     lease controller is invoked.
     """
+    if allowed_rental_types is None:
+        permitted_rentals = {"ondemand", "bid"}
+    else:
+        if (not isinstance(allowed_rental_types, Sequence)
+                or isinstance(allowed_rental_types, (str, bytes))
+                or not allowed_rental_types
+                or any(not isinstance(kind, str) or kind not in {"ondemand", "bid"}
+                       for kind in allowed_rental_types)):
+            raise ValueError("allowed_rental_types must be a non-empty subset of ondemand and bid")
+        permitted_rentals = set(allowed_rental_types)
     workload = request.get("workload", {})
     simultaneous = (request.get("simultaneous_model_set")
                     or (workload.get("simultaneous_model_set") if isinstance(workload, Mapping) else None))
@@ -488,8 +499,15 @@ def route_request(request: Mapping[str, Any], *, evidence_by_candidate: Mapping[
                 "candidate_comparisons": comparisons,
                 "required_inputs": ["new compatible listing or explicitly authorized bounded validation"],
                 "paid_action_allowed": False}
-    action_offers = [o for o in ranking["eligible"] if o.get("rental_type") in {"ondemand", "bid"}]
+    eligible_actionable = [o for o in ranking["eligible"] if o.get("rental_type") in {"ondemand", "bid"}]
+    action_offers = [o for o in eligible_actionable if o.get("rental_type") in permitted_rentals]
     reserved_offers = [o for o in ranking["eligible"] if o.get("rental_type") == "reserved"]
+    if not action_offers and eligible_actionable:
+        return {"request_id": request.get("request_id"), "state": "BLOCKED_ACQUISITION_STRATEGY",
+                "next_action": "wait_for_an_offer_in_the_authorized_rental_types_or_authorize_another_mode",
+                "allowed_rental_types": sorted(permitted_rentals),
+                "available_rental_types": sorted({o.get("rental_type") for o in eligible_actionable}),
+                "candidate_comparisons": comparisons, "paid_action_allowed": False}
     if not action_offers and reserved_offers:
         return {"request_id": request.get("request_id"), "state": "RESERVED_PREPAYMENT_NOT_AUTHORIZED",
                 "next_action": "report_reserved_equivalent_separately_and_require_exact_conversion_terms_and_prepaid_cap",

@@ -2,6 +2,13 @@
 
 Read the linked Vast.ai docs before changing marketplace, billing, API-key, or instance-lifecycle behavior. These are primary sources from Vast.ai. Reviewed 2026-09-28.
 
+## First-party SDK and CLI
+
+- [Vast.ai Python SDK and CLI](https://github.com/vast-ai/vast-cli) — the official package is `vastai`; on Windows it is installed with `pip install vastai`. Its CLI includes `search offers`, `create instance`, `show instance(s)`, and `destroy instance`. The SDK exposes corresponding search, create, show, and destroy methods. Reviewed 2026-09-29.
+- [SDK lifecycle reference](https://github.com/vast-ai/vast-cli/blob/master/vastai_sdk/SKILL.md) — documents `VastAI.search_offers`, `create_instance`, `show_instance`/`show_instances`, and `destroy_instance`, plus `SyncClient` equivalents.
+
+The broker now presents those lifecycle verbs as `vast-broker search`, `create`, `status`, and `destroy`. These are broker operations: `create` runs the pinned, router-authorized Open-Jev workflow; `status` and `destroy` require a request ID in the private lease journal. The provider adapter uses Vast's documented API routes so the broker can retain explicit pagination checks, sanitize responses, and verify full account inventory and separate volume absence. The first-party CLI/SDK are useful for standalone Vast administration, but a direct create/destroy call does not perform this broker's spend authorization, durable ownership, or post-destroy verification.
+
 ## Marketplace and offers
 
 - [Search offers API](https://docs.vast.ai/api-reference/search/search-offers) — `POST /api/v0/bundles`; type values are `ondemand`, `bid`, and `reserved`; fields include total hourly price, storage, bandwidth rates, GPU/RAM/disk, verification, and current rentable state. The `duration` filter is a minimum remaining offer duration, not a lease timeout.

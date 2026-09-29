@@ -2,15 +2,34 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 import sys
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .market import search_offers
 from .provider import VastOffersClient
-from .router import route_request
+from .journal import LeaseJournal
+from .lease import LeaseController, LeaseError
+from .openjev import (
+    OPENJEV_MODEL_REPOSITORY,
+    OPENJEV_MODEL_REVISION,
+    OpenJevTrialOperation,
+    deployment_recipe,
+    lease_plan_from_proposal,
+    trial_steps,
+    validate_health_response,
+    validate_probe_response,
+)
+from .research import resolve_request
+from .router import authorize_run, candidate_key, route_request
 
 
 def _read_json(path: str) -> Any:
@@ -30,9 +49,379 @@ def _write_json(value: Any, path: str | None = None) -> None:
         print(encoded)
 
 
+def _load_factory(spec: str) -> Any:
+    module_name, separator, callable_name = spec.partition(":")
+    if not separator or not module_name or not callable_name:
+        raise ValueError("guardian factory must be module:callable")
+    factory = getattr(importlib.import_module(module_name), callable_name)
+    if not callable(factory):
+        raise ValueError("guardian factory must identify a callable")
+    return factory()
+
+
+def lease_provider_factory() -> VastOffersClient:
+    """Build the independent supervisor's scoped Vast lifecycle client."""
+    api_key = os.environ.get("VAST_BROKER_LEASE_API_KEY")
+    if not api_key:
+        raise ValueError("VAST_BROKER_LEASE_API_KEY is not configured")
+    return VastOffersClient(api_key=api_key)
+
+
+def _trial_report(route: dict[str, Any], lease: dict[str, Any] | None,
+                  record: dict[str, Any] | None) -> dict[str, Any]:
+    result = record.get("operation_result") if isinstance(record, dict) else None
+    if not isinstance(result, dict):
+        result = {}
+    plan = record.get("plan") if isinstance(record, dict) else None
+    instance = lease.get("instance") if isinstance(lease, dict) else None
+    instance_id = instance.get("id") if isinstance(instance, dict) else None
+    absence = record.get("absence_evidence") if isinstance(record, dict) else None
+    owned_ids = absence.get("owned_instance_ids") if isinstance(absence, dict) else None
+    inventory = absence.get("instance_inventory") if isinstance(absence, dict) else None
+    result_digest = record.get("operation_result_sha256") if isinstance(record, dict) else None
+    try:
+        encoded_result = json.dumps(
+            result, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        result_digest_matches = (
+            isinstance(result_digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", result_digest) is not None
+            and hashlib.sha256(encoded_result).hexdigest() == result_digest
+        )
+    except (TypeError, ValueError, UnicodeEncodeError):
+        result_digest_matches = False
+    inventory_valid = (
+        isinstance(inventory, dict)
+        and inventory.get("complete") is True
+        and isinstance(inventory.get("instance_count"), int)
+        and not isinstance(inventory.get("instance_count"), bool)
+        and inventory["instance_count"] >= 0
+        and isinstance(inventory.get("instance_ids_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", inventory["instance_ids_sha256"]) is not None
+    )
+    try:
+        operation_completed = datetime.fromisoformat(record["operation_completed_at_utc"])
+        inventory_checked = datetime.fromisoformat(absence["checked_at_utc"])
+        cleanup_confirmed = datetime.fromisoformat(record["confirmed_absent_at_utc"])
+        timestamps_valid = (
+            operation_completed.tzinfo is not None
+            and inventory_checked.tzinfo is not None
+            and cleanup_confirmed.tzinfo is not None
+            and operation_completed <= inventory_checked <= cleanup_confirmed
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):
+        timestamps_valid = False
+    response_valid = False
+    step_receipts_valid = False
+    try:
+        checked_probe = validate_probe_response(json.dumps(
+            result["response"], ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        ))
+        reported_identity = result.get("model_identity")
+        step_receipts = result.get("step_receipts")
+        expected_step_names = {step.name for step in trial_steps()}
+        step_receipts_valid = (
+            isinstance(step_receipts, dict)
+            and set(step_receipts) == expected_step_names | {"model_identity"}
+            and all(
+                isinstance(step_receipts.get(name), str)
+                and re.fullmatch(r"[0-9a-f]{64}", step_receipts[name]) is not None
+                for name in expected_step_names
+            )
+            and validate_health_response(step_receipts["model_identity"])["model"]
+                == checked_probe["model_identity"]["model"]
+            and validate_health_response(step_receipts["model_identity"])["method"]
+                == checked_probe["model_identity"]["method"]
+        )
+        response_valid = (
+            result.get("choice") == checked_probe["choice"]
+            and result.get("probabilities") == checked_probe["probabilities"]
+            and reported_identity == checked_probe["model_identity"]
+            and isinstance(result.get("response_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", result["response_sha256"]) is not None
+        )
+    except (KeyError, TypeError, ValueError, UnicodeEncodeError):
+        pass
+    inference_ok = (
+        result.get("state") == "inference_verified"
+        and result.get("instance_id") == str(instance_id)
+        and result_digest_matches
+        and response_valid
+        and step_receipts_valid
+        and isinstance(plan, dict)
+        and plan.get("proposal_digest") == route.get("proposal_digest")
+    )
+    cleanup_ok = (
+        isinstance(record, dict)
+        and record.get("request_id") == route.get("request_id")
+        and record.get("state") == "DESTROYED"
+        and isinstance(absence, dict)
+        and absence.get("owned_instance_ids_absent") is True
+        and absence.get("owned_volume_ids_absent") is True
+        and isinstance(absence.get("owned_volume_ids"), list)
+        and isinstance(owned_ids, list)
+        and len(owned_ids) == 1
+        and str(instance_id) in owned_ids
+        and inventory_valid
+        and timestamps_valid
+    )
+    return {
+        "request_id": route.get("request_id"),
+        "proposal_digest": route.get("proposal_digest"),
+        "state": "OPENJEV_LIVE_TEST_PASSED" if inference_ok and cleanup_ok else "OPENJEV_LIVE_TEST_INCOMPLETE",
+        "instance_id": instance_id,
+        "offer": route.get("proposal", {}).get("offer"),
+        "cost_bound": route.get("proposal", {}).get("cost_bound"),
+        "inference": ({
+            "state": result.get("state"),
+            "choice": result.get("choice"),
+            "probabilities": result.get("probabilities"),
+            "model_identity": result.get("model_identity"),
+            "response_sha256": result.get("response_sha256"),
+        } if inference_ok else None),
+        "operation_result_sha256": record.get("operation_result_sha256") if isinstance(record, dict) else None,
+        "cleanup": {
+            "state": record.get("state") if isinstance(record, dict) else (lease or {}).get("state"),
+            "verified_at_utc": record.get("confirmed_absent_at_utc") if isinstance(record, dict) else None,
+            "absence_evidence": absence,
+        },
+    }
+
+
+def _run_openjev(args: argparse.Namespace) -> int:
+    request = _read_json(args.request)
+    evidence = _read_json(args.evidence)
+    limits = _read_json(args.limits)
+    if not isinstance(request, dict) or not isinstance(evidence, dict) or not isinstance(limits, dict):
+        raise ValueError("request, evidence and limits files must each contain JSON objects")
+    try:
+        hourly_cap = Decimal(str(limits["max_hourly_usd"]))
+    except (KeyError, InvalidOperation, ValueError, TypeError):
+        hourly_cap = None
+    if hourly_cap is not None and hourly_cap.is_finite() and hourly_cap > Decimal("0.20"):
+        blocked = {
+            "request_id": request.get("request_id"),
+            "state": "BLOCKED_OWNER_HOURLY_CAP",
+            "reason": "Open-Jev trial cannot exceed the owner's $0.20 all-in hourly ceiling",
+            "paid_action_allowed": False,
+        }
+        _write_json(blocked, args.output)
+        return 2
+    search_key = os.environ.get("VAST_BROKER_SEARCH_API_KEY")
+    lease_key = os.environ.get("VAST_BROKER_LEASE_API_KEY")
+    if not search_key or not lease_key:
+        raise ValueError("scoped search and lease Vast credentials must be configured in the local secret store")
+    if not os.environ.get("VAST_BROKER_CONTROL_HOST_ID"):
+        raise ValueError("VAST_BROKER_CONTROL_HOST_ID must identify this control host")
+    journal_dir = os.environ.get("VAST_BROKER_JOURNAL_DIR")
+    if not journal_dir:
+        raise ValueError("VAST_BROKER_JOURNAL_DIR must point to private durable local storage")
+    gate_factory = os.environ.get("VAST_BROKER_GUARDIAN_GATE_FACTORY")
+    if not gate_factory:
+        raise ValueError("two remote recovery paths and their shared registry are not configured")
+
+    # Resolve the exact candidate before binding the pinned runtime recipe.
+    resolution = resolve_request(request)
+    disk = limits.get("temporary_disk_gb")
+    if isinstance(disk, bool) or not isinstance(disk, int):
+        raise ValueError("Open-Jev run requires an integer temporary disk limit")
+    recipes: dict[str, Any] = {}
+    for candidate in resolution.get("candidates", []):
+        identity = candidate.get("identity", {})
+        if (identity.get("artifact_repo") == OPENJEV_MODEL_REPOSITORY
+                and identity.get("revision") == OPENJEV_MODEL_REVISION):
+            recipes[candidate_key(candidate)] = deployment_recipe(identity, disk)
+    if len(recipes) != 1:
+        raise ValueError("request must resolve to the exact pinned Open-Jev 9B artifact")
+    request["deployment_recipes_by_candidate"] = recipes
+
+    read_client = VastOffersClient(api_key=search_key)
+    lease_client = VastOffersClient(api_key=lease_key)
+
+    def search_current(constraints: Any, requested_disk: float | int | None) -> dict[str, Any]:
+        return search_offers(constraints, client=read_client, disk_gb=requested_disk)
+
+    route = route_request(request, evidence_by_candidate=evidence, limits=limits,
+                          offer_searcher=search_current,
+                          allowed_rental_types=("ondemand",))
+    if route.get("state") != "READY_TO_RUN" or not isinstance(route.get("proposal"), dict):
+        _write_json(route, args.output)
+        return 2
+    _write_json({"state": route["state"], "proposal": route["proposal"],
+                 "proposal_digest": route["proposal_digest"]}, args.proposal_output)
+
+    proposal = route["proposal"]
+    plan = lease_plan_from_proposal(proposal)
+    required_provider_factory = "vast_broker.cli:lease_provider_factory"
+    configured_provider_factory = os.environ.get("VAST_BROKER_PROVIDER_FACTORY")
+    if configured_provider_factory not in (None, required_provider_factory):
+        raise ValueError("Open-Jev runner requires its pinned Vast lifecycle provider factory")
+    os.environ["VAST_BROKER_PROVIDER_FACTORY"] = required_provider_factory
+    journal = LeaseJournal(journal_dir)
+    controller = LeaseController(lease_client, journal, guardian_gate=_load_factory(gate_factory))
+    request_id = str(route["request_id"])
+    if journal.load(request_id) is not None:
+        _write_json(_trial_report(route, None, None), args.output)
+        return 1
+    plan["proposal_digest"] = route["proposal_digest"]
+    failure: BaseException | None = None
+    lease: dict[str, Any] | None = None
+    try:
+        lease = authorize_run(
+            proposal,
+            route["proposal_digest"],
+            current_proposal=proposal,
+            lease_controller=controller,
+            plan=plan,
+            operation=OpenJevTrialOperation(lease_client),
+        )
+    except BaseException as exc:
+        failure = exc
+        if isinstance(exc, LeaseError):
+            lease = exc.result
+    record = journal.load(str(route["request_id"]))
+    report = _trial_report(route, lease, record)
+    _write_json(report, args.output)
+    if failure is not None or report["state"] != "OPENJEV_LIVE_TEST_PASSED":
+        return 1
+    return 0
+
+
+def _lease_journal() -> LeaseJournal:
+    journal_dir = os.environ.get("VAST_BROKER_JOURNAL_DIR")
+    if not journal_dir:
+        raise ValueError("VAST_BROKER_JOURNAL_DIR must point to private durable storage")
+    return LeaseJournal(journal_dir)
+
+
+def _owned_resource_ids(record: dict[str, Any], field: str) -> list[str]:
+    values = record.get(field)
+    absence = record.get("absence_evidence")
+    if not isinstance(values, list) or not values:
+        values = absence.get(field) if isinstance(absence, dict) else []
+    return sorted({str(value) for value in values if isinstance(value, (str, int)) and str(value)})
+
+
+def _safe_provider_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Expose lifecycle facts without leaking connection details or env values."""
+    safe: dict[str, Any] = {}
+    for key in ("id", "actual_status", "status", "state", "label", "gpu_name", "dph_total", "start_date"):
+        value = row.get(key)
+        if (isinstance(value, (str, int, bool))
+                or isinstance(value, float) and math.isfinite(value)):
+            safe[key] = value
+    return safe
+
+
+def _lease_status_payload(
+    record: dict[str, Any],
+    instances: list[dict[str, Any]] | None,
+    volumes: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    instance_ids = _owned_resource_ids(record, "owned_instance_ids")
+    volume_ids = _owned_resource_ids(record, "owned_volume_ids")
+    present_instances = []
+    present_volumes = []
+    if instances is not None:
+        present_instances = [
+            _safe_provider_row(row) for row in instances
+            if str(row.get("id")) in instance_ids
+        ]
+    if volumes is not None:
+        present_volumes = [
+            _safe_provider_row(row) for row in volumes
+            if str(row.get("id")) in volume_ids
+        ]
+    instance_absence = (
+        not present_instances if instances is not None and instance_ids else None
+    )
+    volume_absence = (
+        not present_volumes if volumes is not None else None
+    ) if not volume_ids else (
+        not present_volumes if volumes is not None else None
+    )
+    cleanup_verified = (
+        record.get("state") in {"DESTROYED", "FAILED_CLEAN"}
+        and instance_absence is True
+        and volume_absence is True
+    )
+    absence = record.get("absence_evidence")
+    return {
+        "request_id": record.get("request_id"),
+        "state": record.get("state"),
+        "owned_instance_ids": instance_ids,
+        "owned_volume_ids": volume_ids,
+        "instance_inventory_complete": instances is not None,
+        "volume_inventory_complete": volumes is not None,
+        "owned_instances_absent": instance_absence,
+        "owned_volumes_absent": volume_absence,
+        "cleanup_verified": cleanup_verified,
+        "instances": present_instances,
+        "volumes": present_volumes,
+        "operation_result_state": (
+            record.get("operation_result", {}).get("state")
+            if isinstance(record.get("operation_result"), dict) else None
+        ),
+        "last_verified_absent_at_utc": (
+            record.get("confirmed_absent_at_utc")
+            if isinstance(absence, dict) or record.get("confirmed_absent_at_utc") else None
+        ),
+    }
+
+
+def _read_owned_inventory(client: VastOffersClient) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+    """Read both complete account inventories; a failed read never means absent."""
+    instances: list[dict[str, Any]] | None = None
+    volumes: list[dict[str, Any]] | None = None
+    try:
+        instances = client.list_instances()
+    except Exception:
+        pass
+    try:
+        volumes = client.list_volumes()
+    except Exception:
+        pass
+    return instances, volumes
+
+
+def _status_request(args: argparse.Namespace) -> int:
+    journal = _lease_journal()
+    record = journal.load(args.request_id)
+    if record is None:
+        _write_json({"request_id": args.request_id, "state": "NOT_FOUND"}, args.output)
+        return 2
+    client = lease_provider_factory()
+    instances, volumes = _read_owned_inventory(client)
+    result = _lease_status_payload(record, instances, volumes)
+    _write_json(result, args.output)
+    return 0 if instances is not None and volumes is not None else 1
+
+
+def _destroy_request(args: argparse.Namespace) -> int:
+    journal = _lease_journal()
+    record = journal.load(args.request_id)
+    if record is None:
+        _write_json({"request_id": args.request_id, "state": "NOT_FOUND", "destroyed": False}, args.output)
+        return 2
+    client = lease_provider_factory()
+    controller = LeaseController(client, journal)
+    try:
+        record = controller.cancel(args.request_id) or journal.load(args.request_id) or record
+    except LeaseError as exc:
+        record = exc.result or journal.load(args.request_id) or record
+    except Exception as exc:
+        print(f"vast-broker: destroy failed ({type(exc).__name__})", file=sys.stderr)
+        record = journal.load(args.request_id) or record
+    instances, volumes = _read_owned_inventory(client)
+    result = _lease_status_payload(record, instances, volumes)
+    result["destroyed"] = result["cleanup_verified"]
+    _write_json(result, args.output)
+    return 0 if result["destroyed"] else 1
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vast-broker",
-        description="Research-first routing and read-only Vast marketplace tools")
+        description="Evidence-first Vast rental search and guarded Open-Jev lifecycle tools")
     commands = parser.add_subparsers(dest="command", required=True)
     route = commands.add_parser("route", help="advance one request through evidence, quote and cap gates")
     route.add_argument("--request", required=True, help="JSON model/workload request")
@@ -41,12 +430,31 @@ def _parser() -> argparse.ArgumentParser:
     route.add_argument("--limits", help="explicit owner spend and lifecycle limits JSON")
     route.add_argument("--output", help="write the structured route result to this path")
 
-    offers = commands.add_parser("offers", help="perform a read-only live marketplace search")
-    offers.add_argument("--filters", help="optional JSON object of documented offer constraints")
-    offers.add_argument("--disk-gb", type=float, help="disk allocation used for price statistics")
-    offers.add_argument("--page-size", type=int, default=100)
-    offers.add_argument("--max-pages", type=int, default=20)
-    offers.add_argument("--output", help="write normalized offers to this path")
+    search = commands.add_parser("search", aliases=["offers"],
+                                 help="perform a read-only live marketplace search")
+    search.add_argument("--filters", help="optional JSON object of documented offer constraints")
+    search.add_argument("--disk-gb", type=float, help="disk allocation used for price statistics")
+    search.add_argument("--page-size", type=int, default=100)
+    search.add_argument("--max-pages", type=int, default=20)
+    search.add_argument("--output", help="write normalized offers to this path")
+
+    trial = commands.add_parser(
+        "create", aliases=["run-openjev"],
+        help="create one guarded Open-Jev 9B trial, run inference, and verify teardown"
+    )
+    trial.add_argument("--request", required=True, help="exact artifact request JSON")
+    trial.add_argument("--evidence", required=True, help="captured source evidence by candidate key")
+    trial.add_argument("--limits", required=True, help="explicit finite owner spend and lifecycle limits JSON")
+    trial.add_argument("--output", required=True, help="private JSON result receipt path")
+    trial.add_argument("--proposal-output", required=True, help="write the fresh quote and bound proposal before create")
+
+    status = commands.add_parser("status", help="inspect one journaled lease and refresh its provider status")
+    status.add_argument("request_id", help="request ID returned by the broker")
+    status.add_argument("--output", help="write the structured status to this path")
+
+    destroy = commands.add_parser("destroy", help="destroy and verify cleanup for one broker-owned request")
+    destroy.add_argument("request_id", help="request ID returned by the broker; arbitrary Vast IDs are not accepted")
+    destroy.add_argument("--output", help="write the structured cleanup receipt to this path")
     return parser
 
 
@@ -66,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
             # Routing outcomes are machine-readable results, including valid
             # research/input gates. They are not process failures.
             return 0
-        if args.command == "offers":
+        if args.command in {"offers", "search"}:
             if not os.environ.get("VAST_API_KEY"):
                 raise ValueError("VAST_API_KEY must be supplied by the configured secret store")
             filters = _read_json(args.filters) if args.filters else {}
@@ -76,6 +484,12 @@ def main(argv: list[str] | None = None) -> int:
                                    max_pages=args.max_pages, disk_gb=args.disk_gb)
             _write_json(result, args.output)
             return 0
+        if args.command in {"run-openjev", "create"}:
+            return _run_openjev(args)
+        if args.command == "status":
+            return _status_request(args)
+        if args.command == "destroy":
+            return _destroy_request(args)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         # Do not print provider exception bodies or request headers. The Vast
         # adapter already emits sanitized errors; local file errors are safe.

@@ -190,6 +190,15 @@ def test_create_intent_is_durable_before_remote_create_and_success_is_verified(t
         return original_create(offer, params)
 
     provider.create_instance = create
+    observed_at_destroy = []
+    original_destroy = provider.destroy_instance
+
+    def destroy(iid):
+        saved = journal.load("request-1")
+        observed_at_destroy.append((saved.get("operation_result"), saved.get("operation_result_sha256")))
+        return original_destroy(iid)
+
+    provider.destroy_instance = destroy
     def operation(inst):
         record = journal.load("request-1")
         assert guardian_gate.published == [(("1",), ("901",))]
@@ -204,7 +213,33 @@ def test_create_intent_is_durable_before_remote_create_and_success_is_verified(t
     assert provider.instances == {}
     assert provider.volumes == {}
     assert provider.cleanup_events == [("instance", "1"), ("volume", "901")]
-    assert journal.load("request-1")["confirmed_absent_at_utc"]
+    saved = journal.load("request-1")
+    assert saved["confirmed_absent_at_utc"]
+    assert saved["operation_result"] == "ok"
+    assert saved["operation_result_sha256"]
+    assert saved["absence_evidence"]["owned_instance_ids"] == ["1"]
+    assert saved["absence_evidence"]["owned_instance_ids_absent"] is True
+    assert saved["absence_evidence"]["owned_volume_ids"] == ["901"]
+    assert saved["absence_evidence"]["owned_volume_ids_absent"] is True
+    assert saved["absence_evidence"]["instance_inventory"]["complete"] is True
+    assert saved["absence_evidence"]["instance_inventory"]["instance_count"] == 0
+    assert len(saved["absence_evidence"]["instance_inventory"]["instance_ids_sha256"]) == 64
+    assert observed_at_destroy == [("ok", saved["operation_result_sha256"])]
+
+
+def test_unrecordable_operation_result_fails_the_trial_but_still_destroys(tmp_path):
+    provider = FakeProvider()
+    journal = LeaseJournal(tmp_path)
+    ctl = LeaseController(provider, journal, FakeSupervisor(), guardian_gate=FakeGuardianGate())
+
+    with pytest.raises(LeaseError, match="operation failed; cleanup was attempted"):
+        ctl.run("unrecordable-result", plan(), lambda _: {"non_finite": float("nan")})
+
+    record = journal.load("unrecordable-result")
+    assert record["state"] == "DESTROYED"
+    assert "operation_result" not in record
+    assert provider.instances == {}
+    assert provider.destroy_calls == ["1"]
 
 
 def test_volume_delete_failure_keeps_cleanup_pending_and_retries(tmp_path):
@@ -574,7 +609,11 @@ def test_deadline_supervisor_destroys_while_user_callback_is_blocked(tmp_path):
     release.set()
     thread.join(3)
     assert not thread.is_alive()
-    assert output and isinstance(output[0], dict) and output[0]["state"] == "DESTROYED"
+    # The callback finished only after the hard deadline had already destroyed
+    # its lease, so its late result cannot count as a successful paid run.
+    assert output and isinstance(output[0], LeaseError)
+    assert output[0].result["state"] == "DESTROYED"
+    assert "operation_result" not in journal.load("blocked-callback")
 
 
 def test_malformed_or_unavailable_listing_never_confirms_absence(tmp_path):
