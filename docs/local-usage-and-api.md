@@ -14,10 +14,10 @@ vast-broker --help
 To start from another project, clone this repository or install a reviewed commit directly:
 
 ```powershell
-python -m pip install "git+https://github.com/Pukujan/vastai-gpu-broker.git@<reviewed-commit-sha>"
+python -m pip install "git+https://github.com/Pukujan/vastai-gpu-broker.git@9e98b037d78e34c4287ce1bb8d1bb410511123e9"
 ```
 
-Replace `<reviewed-commit-sha>` with the commit you have inspected. The package requires Python 3.11 or newer and has no runtime third-party dependencies.
+That reviewed commit includes the live-run record and this usage guide. Inspect and pin a newer commit when you adopt later changes. The package requires Python 3.11 or newer and has no runtime third-party dependencies.
 
 ## Find Vast's API, CLI, and SDK
 
