@@ -6,7 +6,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .provider import VastOffersClient
 
