@@ -1,0 +1,83 @@
+{
+  "$id": "https://project-continuity.dev/schema/v1/task.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "acceptance": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "depends_on": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "goal": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "id": {
+      "pattern": "^[A-Z][A-Z0-9]*-[0-9]{4}$",
+      "type": "string"
+    },
+    "issue_url": {
+      "format": "uri",
+      "pattern": "^https://github\\.com/[^/]+/[^/]+/issues/[1-9][0-9]*$",
+      "type": "string"
+    },
+    "next_action": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "owner": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "priority": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "protocol_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "const": "project-continuity.task.v1"
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "active",
+        "blocked",
+        "completed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "why": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "protocol_version",
+    "id",
+    "status",
+    "owner",
+    "priority",
+    "depends_on",
+    "goal",
+    "why",
+    "acceptance",
+    "next_action"
+  ],
+  "title": "Task metadata v1",
+  "type": "object"
+}

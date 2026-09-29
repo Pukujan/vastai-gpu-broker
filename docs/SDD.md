@@ -1,0 +1,241 @@
+# Spec-driven design
+
+Status: implementation contract. Interface names below are the target public interface; the checkpoint records which are implemented.
+
+## Module and agent router
+
+Implement a Python package `vast_broker` with `python -m vast_broker` as its CLI. The importable API and CLI call the same validator, planner, and lifecycle controller. Wrap those operations in MCP later if needed. The wrapper must not contain a second policy implementation.
+
+An adopter supplies a `Request` and calls the router. The router returns structured JSON with `request_id`, `state`, `next_action`, `required_inputs`, `research_tasks`, `artifact_paths`, `reason_codes`, and `paid_action_allowed`. It also returns `resolution_mode`, `selection_scope_digest`, `candidate_selection_required`, `explore_alternatives_required`, and `question_reason`. Every rejected command emits the same next-action contract. No step depends on remembering this conversation.
+
+Target commands:
+
+| Command | Purpose | Paid side effect |
+|---|---|---|
+| `route` | Create/inspect a request and return the next required action. | None |
+| `research` | Capture sources and validate the submitted model/deployment evidence. | None |
+| `offers` | Refresh live offers through the configured provider client. | None |
+| `plan` | Validate evidence/caps, compare candidates, emit a bound proposal. | None |
+| `run` | Revalidate proposal and execute its bounded installation/inference task. | May create/manage an owned lease |
+| `status` | Inspect request/lease/research/cleanup status. | None |
+| `reconcile` | Recover and destroy owned unresolved or expired leases. | Destruction only |
+
+The module never silently fills a missing task budget. Owner policy can provide explicit reusable defaults with provenance; the route must expose their source and effective values. Credential presence alone is not payment authorization.
+
+## Data contracts
+
+All artifacts carry `schema_version`, `created_at_utc`, `request_id` and a deterministic content digest. Unknown values are `null` plus an explicit reason, never zero. Use finite decimal arithmetic for USD and integer byte counts for transfer sizes. Preserve original provider records beside normalized fields.
+
+### Request
+
+- Exact model set or unresolved model query; base/checkpoint ID, artifact repository/provider, format, quantization variant, named files/manifests, resolved revision and runtime when known.
+- Resolution mode: `family_discovery`, `base_identified_artifact_open`, `exact_artifact`, or `scoped_auto_select`. Do not conflate base identity with artifact identity.
+- Model-selection record: confirmed exact artifact, exact task authorization, or explicit scoped auto-selection/override with provenance. The selection scope declares permitted base(s)/size, quantization, formats/providers, runtime/compatibility/quality constraints and ranking objective as specified by the task; omitted restrictions are not invented.
+- Workload: intended API, maximum input/candidates/context, batch/concurrency, simultaneous model set, acceptance probe.
+- Explicit `max_hourly_usd`, `max_total_usd`, `max_runtime_seconds`, `max_network_usd`, `start_deadline_seconds`, `temporary_disk_gb` and authorization scope.
+- Allowed rental types and whether reserved prepayment is authorized. Default comparison includes all types; prepayment requires explicit permission because it changes the commitment.
+- If bid is allowed: `max_bid_usd_per_machine_hour`, `bid_increment_usd`, `max_bid_attempts`, and total startup/wait deadline. These can be explicit owner policy, not guessed from account balance.
+- Network-rate policy with owner instruction provenance, currency, preferred/expensive/hard thresholds and declared comparison basis. Current owner values are preferred `< 1`, expensive `>= 2`, hard maximum `3` USD/TB; both directions are checked. The separate `max_network_usd` remains a task spend allowance.
+- Phase limits for startup/download/install/load/warmup/benchmark/useful runtime/interruption/cleanup, and an explicit stopped-retention policy if requested. Unspecified phase durations stay unknown within an explicit overall envelope; the module does not invent them.
+- Storage mode: disposable container by default, or explicitly bounded stopped cache/local volume. Record exact allocations, artifact/cache identity, physical host/attachment scope, quote and deletion deadlines for every retained resource.
+- When benchmarking is requested, its plan records selected runtime/protocol version, workload/dataset digest, warmup/cache state, local preparation receipt, GPU-host engine/loopback client, actual external client identities and checker location. Unknown machine specifications or local monetary costs remain unknown. Ordinary inference still prepares its recipe/probe/controller before renting.
+- Lease mode: `sequential` by default; `parallel_race` requires explicit finite contender count, maximum simultaneous instances/GPUs, per-machine bid caps, aggregate hourly/bid/spend/network/storage/cleanup envelope, startup deadline and shared coordination authority.
+- Validation policy: whether a bounded empirical deployment may test unresolved resource dimensions, precisely which unknowns, and maximum attempts. An ordinary confirmed-fit request cannot silently become an experiment.
+- Idle policy: exact cold-start timeout, idle threshold, active-request timeout, hard destroy deadline, and optional stop/retention stages. Durations come from explicit request/owner policy. Unsettled "few hours" wording is surfaced as missing configuration, not silently converted into a number.
+- Credential handle/environment variable name, never a credential value.
+
+### Source and claim
+
+A source records exact URL, retrieval time, available revision, retrieved-content digest, provenance role, and relevant section/JSON locator. A claim records the exact asserted fact, units, source IDs, covered model/revision/profile, and confidence class:
+
+`publisher_requirement`, `runtime_requirement`, `artifact_measured`, `formula_derived`, `external_tested_configuration`, `local_measured`, or `unknown`.
+
+Research starts with publisher Hugging Face card/config/manifests and upstream installation/runtime sources. When these omit numeric hardware requirements, the router asks the agent to retrieve primary deployment reports for the exact checkpoint and recipe. It asks for failed smaller tiers as well as successful tiers where documented. Absence of a smaller successful report is not proof smaller hardware cannot work.
+
+### Resource evidence and derivation
+
+When a publisher omits numeric requirements, research continues through exact primary config/architecture, checkpoint index/manifests/tensor metadata, selected artifact file bytes and quantization specification, plus runtime memory/cache/placement documentation. Record dense/MoE/hybrid architecture, total versus active parameters, exact quant format and loaded dtype. These facts must refer to the chosen artifact/revision; unrelated parameter-count heuristics are not acceptable evidence.
+
+The `ResourceEstimate` contract separates:
+
+- `artifact_disk_bytes`: measured bytes of each unique required selected file/shard/base/adapter, with manifest/metadata sources. Runtime/image/cache/temp/decompression disk terms are separate known/unknown values.
+- `resident_weight_vram_bytes` and `resident_weight_ram_bytes`: source-backed tensor/quantization/residency terms for the exact runtime. Include quant metadata/scales/codebooks, retained modules, padding and dequantization behavior when documented. On-disk file bytes are not automatically resident memory.
+- `cache_vram_bytes` and `cache_ram_bytes`: architecture-specific cache terms for declared context, batch/concurrency, dtype and device placement.
+- `activation_bytes`, `runtime_overhead_bytes`, `loading_transient_bytes`, and `allocator_overhead_bytes`: sourced/empirically measured terms or explicit unknowns. Peak loading and steady-state serving are reported separately.
+- `known_lower_bound_bytes`, supported ranges if documented, remaining unknown terms, and resulting fit state. A lower bound is insufficient to pass fit while consequential terms remain unknown.
+
+Every derived term records expression, variable values/units, source IDs/locators, runtime/version/workload scope, and assumptions or unresolved variables. Numeric uncertainty bounds must themselves be sourced or measured, not invented percentage headroom. Source retrieval and exact scope checks apply to formulas as well as copied requirements.
+
+For a runtime whose primary documentation establishes conventional full-attention KV layout, an eligible term may use `2 * concurrent_sequences * stored_tokens * full_attention_layers * kv_heads * head_dimension * bytes_per_cache_element`, with every input sourced and actual allocation/placement stated. GQA uses KV heads, not query-head count. Sliding-window, paged allocation/alignment, prefix sharing, compressed/MLA, recurrent/SSM and hybrid caches require their documented allocation rules; do not silently apply the conventional formula. Unsupported layouts leave the relevant term unknown.
+
+For MoE, active parameters describe computation per token and are distinct from total stored/resident expert weights. All resident experts count unless the exact runtime's documented expert offload/residency policy establishes another placement. Explicit CPU offload shifts a sourced resident term to RAM and may introduce transfer/loading requirements; it does not make the memory disappear. Report per-device placement; aggregate multi-GPU VRAM is not a substitute for per-device capacity.
+
+The result is an auditable estimate, not a publisher requirement, guaranteed fit or proven minimum. A resource fit decision still needs documented compatibility/tested configuration or an expressly authorized empirical validation. Combined-model estimates cannot deduplicate shared weights/cache unless the selected runtime documents that sharing; local success covers the actual tested concurrent profile only.
+
+The agent must record OS, exact GPU/count/memory, CPU offload, dtype/quantization, context/batch/cache settings, dependency versions, and differences from the publisher recipe. A source that describes another checkpoint, training, a different batch/context, or multiple pooled cards cannot prove fit for this request.
+
+The core verifies identity, missing fields, known source roles, digest/revision matching, and claim references. It must not accept `verified: true` from an agent as proof. Retrieval and citations are checked against actual captured content where feasible. The core cannot establish scientific truth merely by matching a claim to text; the report retains source limitations.
+
+For a family query or an identified base with an open artifact choice, research returns publisher/base and relevant community quantizer candidates, including supported formats such as GGUF when available. Each exact candidate has independently scoped requirements and published quality/runtime evidence. Read-only live offer comparison may run before model selection. Present suitable unique offer counts plus min/median/mean per-machine hourly quote by rental type, requested disk, compute/storage/network components and sample completeness. Price statistics alone do not select a model or authorize create.
+
+### Artifact-resolution routes
+
+`family_discovery` and `base_identified_artifact_open` require exact candidate selection after research/comparison unless scoped auto-selection is authorized. An official base identifier/qualifier does not choose a community quantization provider, artifact format, or bit variant. If the task expressly restricts to publisher artifacts, respect that restriction and do not substitute community files.
+
+`exact_artifact` means an exact repository/URL and requested artifact name/file set are supplied. Resolve those files and a pinned revision and research only that candidate plus its required base/runtime dependencies. Do not produce a broad alternative menu or seek another model confirmation. Missing owner numeric caps return `INPUT_REQUIRED` with cost-limit reasons, preserving exact selection.
+
+`scoped_auto_select` means the user/developer explicitly permits choosing inside a declared artifact scope, such as compatible 4-bit variants for a named base under a cheapest-valid-hosting objective. Research candidates inside that scope, compare eligible documented/authorized-validation deployments and live costs, and select the best by the authorized objective without another model question. Record selected exact artifact and provenance. This permission does not supply or override missing spend/runtime/network/bid caps.
+
+If the exact artifact is absent or no candidate satisfies the declared scope, distinguish `ARTIFACT_NOT_FOUND`, `NO_CANDIDATE_IN_SCOPE`, `IDENTITY_UNRESOLVED`, and `SOURCE_RETRIEVAL_FAILED`. Set `explore_alternatives_required: true` only when a different artifact/model would require scope expansion and that expansion is not already authorized. A candidate ambiguity with no selection permission sets `candidate_selection_required: true`. Research-retry failures request retrieval recovery rather than treating an artifact as absent.
+
+Require confirmed exact artifact, exact task authorization, or a validated scoped auto-selection record before `PLAN_READY` may authorize a paid transition. Bind the selection receipt to normalized scope, request provenance, chosen artifact/revision/manifest, and objective. Subsequent choices within the same auto-selection scope can be replanned under existing authorization; changes outside scope require new authorization. An agent-generated boolean `confirmed`/`override` with no originating authorization is insufficient.
+
+### Deployment recipe
+
+Separate research prose from executable actions. An executable recipe contains pinned loader/source revision, model/base revisions, selected file manifests, runtime image identity, dependency pins, controlled install/launch steps, health/inference probe, and an artifact identity assertion. Its digest is included in the plan. A mutable branch or floating container tag is insufficient for a reproducible paid plan unless the request expressly accepts it and the resolved identity is recorded.
+
+Do not execute shell commands from a model card or offer description automatically. Convert researched instructions into the explicit recipe. Execute trusted local recipe steps with bounded timeouts and preserve exit/result metadata. Secret-bearing environment values are never serialized into recipe/report artifacts.
+
+### Fit decision
+
+`documented_compatible` means documented requirements match the requested workload and candidate. `source_tested` means an exact relevant deployment report supports this configuration. `validation_required` means the task authorizes a bounded empirical probe with named unresolved dimensions. `incompatible` and `unknown` are separate rejection classes.
+
+Do not claim a larger or equally sized GPU was tested simply because a smaller one was tested. Runtime architecture/driver support can establish compatibility; actual fit stays empirical until validated. Local success is scoped to its measured request profile. Concurrent model requests need combined evidence or a combined validation run with all models resident.
+
+## Cost and selection
+
+Use Vast's current live offer and the requested disk quantity. Preserve compute, requested-storage cost, quoted total hourly cost, upload/download rates, bandwidth, verification, GPU/count/per-GPU memory, CPU/RAM, disk and availability. Validate units using the [search API](https://docs.vast.ai/api-reference/search/search-offers); do not mix decimal TB with TiB or treat aggregate multi-GPU RAM as pooled memory.
+
+Planned cost is compute plus storage for each billable phase plus known transfer amounts at their applicable rates, with an explicitly recorded allowance for remaining transfer. Base/model/image/dependency traffic is included or labeled unknown within an authorized network allowance. Do not add compute/storage to a total field that already includes them. Paused/waiting time belongs in the storage envelope. Estimates remain estimates; actual charges require provider accounting evidence. [Vast pricing](https://docs.vast.ai/guides/instances/pricing)
+
+Eligibility is evaluated before ranking. Among offers able to meet the start deadline, prefer lowest known total task cost when transfer/time inputs permit it, otherwise lowest valid total hourly price with explicit network allowance. Relevant matched-workload measurements may break cost ties or satisfy an explicit performance requirement. Do not turn unrelated TFLOPS/benchmark fields into invented model latency. Expose cost/performance tradeoffs rather than hiding them in undocumented weights.
+
+If searches are incomplete, report "cheapest among observed eligible offers" and truncation evidence. Query supported partitions/filters to reduce truncation when practical. Never claim a global market minimum from a capped response. Preserve all reason codes so the agent can explain rejected offers.
+
+### Acquisition urgency and launch authorization
+
+Treat the GPU-ready deadline and the inference-performance target as separate request fields. The first governs whether the plan may wait for an interruptible bid; the second constrains measured throughput/latency for the exact model, runtime and workload. Do not infer numeric values from "fast", "slow", "rush" or "cheap". Resolve such words through an explicit saved owner profile or ask for the missing deadline/target. If no comparable benchmark evidence exists, report performance as unknown rather than assign a made-up score.
+
+After model selection, honor the user's workload mode: `simultaneous` means every selected model must be resident and pass the combined probe at once; `sequential` means the declared benchmark may unload/switch models and must account for reload/download time and bytes. Sequential tests cannot establish simultaneous fit. Do not automatically recommend or substitute a model; an optional model-selection module may be added separately.
+
+Among current offers that satisfy exact fit, network/storage/spend caps and the start deadline, select by the user's objective. A fast-ready profile may prefer an available on-demand offer or, only when separately authorized, a bounded finite race. A cost-first profile may wait on interruptible bids and increase them only under an explicit per-machine cap, increment/attempt policy and absolute deadline. Vast documents on-demand as high priority and interruptible instances as lower priority that can be paused when outbid or when on-demand demand arrives; bidding therefore does not guarantee a start or uninterrupted execution. [Instance types](https://docs.vast.ai/guides/instances/choosing/instance-types), [change bid API](https://docs.vast.ai/api-reference/instances/change-bid)
+
+Present hourly and whole-run estimates, expected start/wait behavior, rental mode, simultaneous/sequential fit, bid cap/attempt schedule, and all remaining unknowns before launch. `run it` binds only to the exact proposal digest (selected artifacts and mode, workload, recipe, current quote/offer, acquisition strategy, deadlines, and hard hourly/total/network/storage/bid caps). A changed quote or material input invalidates that approval and requires a refreshed estimate. If the request has not already authorized automatic execution inside a concrete saved envelope, wait for this launch command. A parallel race additionally requires every aggregate reservation in P37.
+
+Refresh immediately before creation. Bind the plan to request/evidence/recipe/offer digests, explicit caps, quote capture time and expiry. Relevant mutation invalidates the plan. A current offer may disappear or change; replan inside unchanged authorization instead of using an old quote.
+
+Use candidate-specific live queries with documented requirement filters, not the capped cached all-market list. Compute descriptive price statistics over distinct offer/type records and label the quoted disk allocation. Deduplicate identical records; conflicting duplicates are uncertain. On-demand quotes, bid floor/current bid scenarios and reserved pricing observations remain separate. Search `type=reserved` is a comparison quote only: the UI rents on-demand first, then converts the existing instance to reserved by prepaying a selected commitment term. Do not rank it as an ordinary hourly create. Selecting that path requires explicit owner authorization plus an exact prepayment/term quote; the current broker has no conversion operation and must keep it ineligible even when the quote is observed. An empty or unconfirmed-fit sample has no made-up average. Truncated samples carry their limit warning into every statistic.
+
+### Owner transfer-rate policy and provider units
+
+Persist an `OwnerNetworkPolicy` containing source/provenance, USD currency, comparison basis, preferred strict threshold `1`, expensive inclusive threshold `2`, hard inclusive cap `3`, and required directions `up` and `down`. Classify `max(up, down)` on one established basis: `< 1` preferred, `1 <= rate < 2` within cap but outside preference, `2 <= rate <= 3` expensive, and `> 3` rejected. The preference does not supply missing paid limits or override full task cost and deadline ranking. Record both directional results and `NETWORK_RATE_CAP_EXCEEDED` when either fails. An older workspace guide cannot replace this current instruction.
+
+`ProviderUnitEvidence` records raw provider labels/values, native per-GB and native per-TB values separately, exact directional field mapping, source/digest/locator, documented conversion relation, `provider_gb_bytes`, `provider_month_seconds`, and scope. Unknown divisors are null with reasons. Vast documents per-GB network prices and MB/s speeds. Its official CLI multiplies host `listed_inet_*_cost` by 1024 for columns labelled $/TB; that display convention is not proof of the offer's per-TB mapping or bytes per billable GB. Its illustrative API values cannot resolve conflicting directional fields. [Search API](https://docs.vast.ai/api-reference/search/search-offers), [pinned CLI display source](https://github.com/vast-ai/vast-cli/blob/317321568b5d88f765fbdcd5a9ea3578896dc526/vastai/cli/display.py)
+
+The current broker comparison basis is explicitly `vast_cli_display_equivalent`: 1024 times each documented raw USD/GB rate, following the pinned CLI display convention. This is a policy normalization and does not assert a provider billing byte divisor. Keep native per-TB values as separately labelled cross-checks; conflicting same-direction values fail closed. A native-only value cannot be relabelled as display-equivalent without established relation evidence. `NETWORK_UNIT_BASIS_REQUIRED` routes missing evidence to research; `NETWORK_UNIT_CONFLICT` preserves contradictions and blocks the affected rate gate. Do not silently multiply/divide by 1000 or 1024, label the display as SI TB/TiB, choose GB/GiB byte divisors, or assume 730 hours/month. Both documented USD rates equal to zero establish zero transfer charge independently of a missing byte divisor; a missing/invalid rate is never zero.
+
+### Exact-allocation cost ledger
+
+`CostQuote` binds offer/rental type, raw quote digest/time, exact `allocated_storage` search quantity and intended create allocation, `dph_total`, `dph_base`, documented running/stopped storage hourly components, raw monthly rate, and separately quoted volumes. The official client sends `allocated_storage`; change in any allocation invalidates the quote/plan. Treat `dph_total` as the provider hourly quote for that bound search, and show any unresolved component semantics. Storage component derivation from a monthly rate requires an evidenced month divisor; otherwise that diagnostic stays unknown. [Official offer client](https://github.com/vast-ai/vast-cli/blob/317321568b5d88f765fbdcd5a9ea3578896dc526/vastai/api/offers.py)
+
+`CostLedger` contains a line for every contract, billable phase and transfer category. Each line records ownership/attempt ID, state/time interval, amount and unit, rate/quote/source, estimate or measurement class, authorized maximum, unknown reasons, and whether another line already includes it. Required phases are create/allocation, startup, download, install, model load, warmup, benchmark, useful runtime, interruption/wait, optional stop/retention and cleanup. Required traffic categories include image/runtime/dependencies/harness, unique model/base/tokenizer artifacts, dataset, inference input/output, results/checkpoints/logs/telemetry, transport overhead and retries. Artifact disk bytes and transferred bytes are separate facts; unverified host image/cache hits do not remove traffic.
+
+For running phase p, cost is its exact-allocation provider total times seconds/3600. Compute/storage diagnostics are not added again. Stopped/paused phases use their established storage rate; independent volumes are additive throughout their lifetime. Escalated bids require the corresponding new quote or a documented decomposition. Directional transfer is `B_down / U_GB * p_down + B_up / U_GB * p_up`, where B is integer bytes and U_GB is the sourced provider divisor. Consequential missing byte/rate/divisor/time terms keep total cost unknown. An explicitly accepted remaining allowance is labelled an authorized reserve, never measured traffic or a provider-enforced cutoff.
+
+Candidate comparison shows provider total/hour, compute/hour, allocated container/volume storage and retention, both directional rates/bases/speeds, known one-time and expected inference traffic, billable setup/benchmark/runtime, failure/race exposure, estimated task cost and authorized envelope. Actual charges require provider accounting and remain separate from estimates. Reconcile paginated charge records by owned instance/volume IDs and intervals; preserve delayed/rounded/incomplete results. Account top-ups and balance depletion are not task charge breakdowns. [Charges API](https://docs.vast.ai/api-reference/billing/show-charges)
+
+Vast's billing guide describes what the provider may do at zero credits: stop compute, continue disk charges, allow a history-based negative-balance grace buffer, and periodically charge a saved card; without a saved card Vast says it eventually destroys resources but gives no fixed deadline. These behaviors are not this broker's cleanup plan. The broker must request destruction on task completion/failure/cancellation/deadline and its independent guardian must recover when the agent/controller/watchdog disappears. Preserve the billing facts for cost estimates; never wait for account depletion or treat it as task cleanup or a hard spend ceiling. [Vast Billing](https://docs.vast.ai/guides/reference/billing)
+
+Pricing says storage continues while an instance exists; the billing FAQ says offline instances incur neither compute nor storage. Preserve this provider-source discrepancy and reserve storage conservatively until verified deletion. An offline state does not release an owned obligation or justify a free interval without established accounting evidence. [Pricing](https://docs.vast.ai/guides/instances/pricing), [billing FAQ](https://docs.vast.ai/guides/reference/faq/billing)
+
+### Bounded artifact retention
+
+Disposable container storage is the default. `RetentionPlan` records resource/owner/host IDs, exact allocated capacity, pinned cached file manifests and validated hit/miss evidence, storage quote, authorized reuse count/window, measured fresh-versus-warm transfer/load work, attachment constraints and deletion deadline. Deleting files does not resize its fixed allocated contract. A local volume survives instance destruction, bills independently, and attaches only on the same physical machine; delete the attached instance before deleting the volume. A stopped instance also retains storage charges and does not guarantee GPU availability on restart. [Storage types](https://docs.vast.ai/guides/instances/storage/types), [volumes](https://docs.vast.ai/guides/instances/storage/volumes)
+
+With measured saving per reuse S, planned reuse count N, retention rate R and window H, retain only when the authorized objective supports it: dollar savings require `N*S > H*R + cache creation/copy cost + any extra GPU price from host binding`. S includes avoided transfer and avoided billable setup minus warm read/copy/validation work. Every term is sourced or measured; unknown terms leave break-even unknown. A separately authorized faster-ready objective may choose retention within its caps. Revision/quant/runtime changes invalidate cache evidence. Model switching is explicit workload scope and never proof of simultaneous residency.
+
+Owner-PC/Linux/Mac cache preparation may reduce rented setup work but still incurs local resources and subsequent GPU ingress. Do not claim free local compute, free upload, portable Vast volumes or cached image layers. Cross-instance traffic is charged unless the documented same-machine/local-network exception applies to the established route. New network-volume method names alone do not establish current attachment or billing support. [Data movement](https://docs.vast.ai/guides/instances/storage/data-movement)
+
+## Finite interruptible bidding
+
+The create API accepts a per-machine hourly bid. The bid-change API uses `PUT /api/v0/instances/bid_price/{id}` with `client_id: me` and `price`. Validate the current documented endpoint ranges and live minimum before use. [Create API](https://docs.vast.ai/api-reference/instances/create-instance), [bid-change API](https://docs.vast.ai/api-reference/instances/change-bid)
+
+1. Consider currently rentable bid offers and start at the lowest documented live admissible bid that meets the request. Set `cancel_unavail` explicitly to avoid waiting on implicit provider defaults.
+2. After a successful create, persist the instance and observe actual status. An accepted bid is not proof that the model can start.
+3. Raise only according to the explicit increment, attempt limit, bid cap, remaining spend envelope, and start deadline. Record each change.
+4. On-demand has priority over bids; a higher bid cannot overcome it. In sequential mode, if startup misses its deadline, destroy and verify this lease before considering another offer/type.
+5. During a pause, continue the storage/deadline accounting. Resume/escalate only inside authorization; otherwise destroy. A replacement follows the same research/quote gates and cannot overlap its unresolved prior attempt. Explicit finite parallel contenders follow the aggregate race contract below.
+
+Priority and pause behavior are documented in [Vast instance types](https://docs.vast.ai/guides/instances/choosing/instance-types). Immediate capacity is a checked condition with a bounded startup probe, not a bid guarantee.
+
+### Aggregate parallel race
+
+Sequential execution is the initial implementation. `RacePlan` is an explicit later mode with finite named contenders/attempt IDs, exact simultaneous-model deployment digest, per-machine quote/bid caps, maximum concurrent instances/GPUs, aggregate hourly/bid/total/network/storage/cleanup limits and startup/absolute deadlines. Missing aggregate limits block all creates. Before dispatch or escalation, atomically reserve each contender's worst authorized exposure, including all contenders starting/downloading together and bounded loser cleanup. A per-machine cap or assumed first winner is insufficient.
+
+A request ID and deployment/limits digest identify one durable `Operation`; the race is its finite set of `Attempt`s. Shared durable coordination with writer fencing owns reservations and attempts across PC, Linux and Mac. Identical calls attach to the existing operation; changed digests return `REQUEST_DIGEST_CONFLICT` and require replan. Separate per-computer SQLite journals do not satisfy cross-computer deduplication. Each attempt persists one create intent and reconciles its own unclear response before any retry. Uncertainty blocks new dispatch/escalation; already dispatched distinct attempts remain owned and supervised.
+
+The first contender that is running and passes exact hardware preflight plus the complete resident-model/concurrent acceptance probe may become the winner. Immediately cancel/destroy every other started or unclear contender and its request-owned separate volumes; verify each absent. Keep reservations and cleanup obligations until absence is established. `CLEANUP_PENDING` reports unresolved resource IDs and current exposure; it cannot claim one billable contract, zero ongoing cost or complete race success. Winner usage remains permitted only within the still-reserved aggregate envelope. Further paid dispatch/escalation stays blocked during uncertain cleanup.
+
+## State machine and durable lease ownership
+
+`NEW -> RESEARCH_REQUIRED -> MODEL_CONFIRMATION_REQUIRED/ALTERNATIVES_AUTHORIZATION_REQUIRED/EVIDENCE_READY -> INPUT_REQUIRED/PLAN_READY -> CREATE_INTENT -> LEASE_OWNED -> STARTING -> INSTALLING -> PROBING -> READY -> DESTROY_REQUIRED -> VERIFYING_DESTROY -> DESTROYED`.
+
+Exact-artifact and scoped-auto-selection routes skip `MODEL_CONFIRMATION_REQUIRED` when their scope remains valid. Missing cost limits enter `INPUT_REQUIRED` independently; they do not reinstate a resolved model-selection question. Source retrieval errors remain retryable research states.
+
+Any paid phase can enter `DESTROY_REQUIRED`. Unknown create outcome enters `CREATE_UNCERTAIN`; unresolved destruction enters `CLEANUP_PENDING`. Those states forbid new create dispatch for that operation. An authorized race applies the same lifecycle per attempt, retains already dispatched attempts, and adds operation-level contender reservations, winner election and loser cleanup.
+
+Persist request ID, deployment/limits digest, operation/attempt ID, unique attempt label, pre-create owned-instance snapshot, selected offer/recipe/quote/caps, reservations, deadline, and create intent before the network call. Store the returned contract/instance ID atomically and durably before access is returned. Use request-scoped locking and shared fenced coordination for cross-computer/race use. Vast create must not be assumed idempotent; retrying an uncertain create requires account-instance reconciliation first.
+
+If create succeeds remotely but its response is lost, reconcile the complete owned account instance list using the attempt label and prior snapshot. Zero unambiguous matches is not immediate permission to create again while the outcome is uncertain. Multiple matches for one attempt are all cleanup obligations and violate P12. Different authorized race attempts are distinct expected contenders, not duplicate creates. Never destroy unrelated pre-existing account instances.
+
+The broker automatically requests destruction after successful completion (once the benchmark result is durably retrievable), failure, cancellation, or an authorized cold/idle/hard deadline. An independent process monitors durable deadlines and agent/controller/watchdog heartbeats and requests destruction if the agent disappears; the main controller also destroys in normal/error/cancellation cleanup. Start and verify this supervisor before create, not after model installation, so a stalled create/provision/install phase is covered. Startup reconciliation discovers unfinished attempts, instances, retained volumes and reservations before allowing a new paid run. Supervisor/guardian registration failure blocks create. Journal persistence failure before create blocks create; persistence failure after create triggers immediate cleanup and marks failure. The guardian—not a human or the conversational agent—owns the backup cleanup obligation until provider-side absence is confirmed.
+
+Destroy through the provider and then verify through instance/list APIs until absence is confirmed or the retry deadline expires. A 401/403/timeout/malformed response is not absence. A stopped or paused instance is not destroyed. Save deletion attempts, confirmation time, remaining unresolved IDs and provider response metadata without secrets. [Destroy API](https://docs.vast.ai/api-reference/instances/destroy-instance), [owned-instance list](https://docs.vast.ai/api-reference/instances/show-instances)
+
+The deadline and budget are controller limits, not provider-side guarantees. An offline controller cannot force a remote API to succeed. Never report zero ongoing cost before provider absence is established; accrued charges remain payable. Every separately billed volume is journaled and supervised independently: instance absence does not imply volume absence. Explicit bounded retention reports that ongoing resource and its deletion deadline, rather than claiming complete teardown.
+
+The current `ProcessLeaseSupervisor` is a child process on the same control host as the caller. It survives a caller-process exit, but not a shared host shutdown, disk loss, credential loss, or network/provider outage. The worker durably records each tick attempt and sanitized error type, and a separate heartbeat thread updates liveness during a provider call. While the launcher process remains alive, it monitors child exit, stale heartbeat (90 seconds by default), and tick progress (one hour by default), terminates a stale child before restarting it, and records the restart. The longer progress timeout accommodates bounded provider reads, including paginated listings. This covers local worker exit/hang only while that launcher remains alive; it does not monitor the initiating host after the launcher exits and is not an out-of-host guardian. Deployed recovery paths and their failure-injection tests remain unimplemented. Do not treat the current paid-capable Python APIs as a fail-safe workflow.
+
+Before paid creation is supported, require a second recovery guardian outside the rented GPU host; for initiating-host failure coverage it must also be outside the initiating control host. Persist the owned attempt, instance/volume IDs as they become known, deadline, and operation fence to a durable location the guardian can read. The guardian monitors a bounded heartbeat, reconciles the provider's full owned-resource view after missed heartbeats or restart, retries only request-owned cleanup, and sends an alert/update while any resource remains unresolved. Duplicate destroy attempts must be safe and cannot release reservations until fresh provider reads confirm absence.
+
+The pre-create gate now requires two cleanup paths in separate control-host failure domains, each registered against the same durable, fenced lease record. The initiating agent and local child supervisor do not count as either path when they share one host. Both paths must read the create intent and deadline before create, then receive later instance/volume identities or be able to reconcile an ambiguous create by its broker-owned label. Keep Vast credentials in the control plane. A logged-in Chrome/CDP session can help an agent operate a website interactively, but it is tied to that browser host and does not satisfy this gate. Jev's reviewed fork uses the existing Chrome profile; no live session or cleanup test was run.
+
+The user's always-on server is a candidate primary only after its uptime and separation from the initiating host are verified. A hosted recovery worker with a durable registry, such as Cloudflare Workers Cron with D1, is a candidate for the second path and requires a failure-injection proof of startup, health alerting, credential access, recovery delay, and cost limits. GitHub Actions can run a slower reconciliation task, but its scheduled workflow is not a sole guardian: GitHub documents schedule delay/drop behavior and automatic disabling after 60 days of inactivity in public repositories. Neither Cloudflare, GitHub, nor a VPS gives this broker a provider-enforced Vast lifetime. Record the chosen services, shared registry, heartbeat threshold, and measured recovery window before enabling create.
+
+This is still best-effort external control, not a provider-enforced lifetime. The documented create API has no maximum-runtime/auto-destroy field; the management guide says expired instances *may* be deleted 48 hours after expiration, which is not an immediate or deterministic lease TTL. If all guardians, credentials, network paths, or Vast control-plane APIs are unavailable, nothing in the rented container or a dead controller can guarantee deletion. The UI/API key must remain in the control plane; do not put the account key in an untrusted GPU guest to make it self-delete. Therefore the user's max-spend value is a dispatch/operation authorization limit, not an absolute provider-enforced bill ceiling during total control-plane failure. Show this residual exposure before paid launch, preserve `CLEANUP_PENDING`, and never report cleanup complete from a timeout, webhook, or destroy acknowledgement alone.
+
+## Idle and cold lifecycle
+
+The independent supervisor enforces cold-start, inactivity, active-request and absolute lease deadlines. The cold timer starts at owned creation, before model readiness; idle time starts at readiness or the last completed authenticated inference. Polling/agent heartbeat/telemetry traffic does not count as model work. Hung requests have their own bounded timeout and cannot extend the absolute deadline.
+
+For temporary hosting, the final idle action is destroy. An explicit owner policy may request stop first, retain disk for a bounded interval, and then destroy. Stopping the model process alone does not release the GPU; stopping the Vast instance releases compute but retains storage billing; only verified destruction ends ongoing instance storage obligations. Never implement indefinite paused retention as cleanup. [Vast pricing](https://docs.vast.ai/guides/instances/pricing)
+
+The supervisor cannot rely on the main agent to announce it forgot a lease. Record meaningful activity in the durable journal or authenticated runtime telemetry. If activity cannot be measured reliably, enforce the hard deadline and report the idle-measurement limitation rather than claim an effective idle policy. Multiple models share a lease; any authenticated workload activity updates lease usage, without allowing a noisy health endpoint to keep it alive indefinitely.
+
+## Research and inference results
+
+The acceptance probe must exercise the model's actual published interface and assert its declared schema, finite outputs, expected keys/shapes, and checkpoint/base/loader identity. Model readiness means a real response from the installed model, not SSH, a TCP listener, or installer completion. Record response, latency, measured GPU/host memory, and transfer counters if available. Do not publish task-private payloads or secrets.
+
+For simultaneous requests, `AcceptanceReceipt` binds the complete model-set digest, per-device placement/residency evidence, declared concurrency/context/cache settings, all model identities/probe outputs, time interval and peak/steady measurements. Sequential loading or one-model readiness cannot pass the combined probe or win a race. A partial failure follows the same cleanup lifecycle unless an explicit bounded retry remains inside authorization.
+
+A validation run can promote only its exact measured deployment/profile to `local_measured`. It cannot claim a universal minimum, untested concurrency, or benchmark quality from one successful request.
+
+### Prepared harness and measurement scope
+
+`PreparationReceipt` binds the portable controller/harness/image version, Linux target architecture, dataset/manifests, recipe/probe/report collector, dependency readiness and stub-endpoint check before paid creation. GPU-specific compilation/loading/warmup remains budgeted rental work. The PC may prepare/control; Gravebuster may reuse its recorded isolated checker harness after current capability discovery; the Mac may use the portable client/controller. No current CPU/RAM/disk/network/uptime or zero local dollar cost is inferred from a machine name or old note.
+
+`BenchmarkReceipt` records exact model/artifact/runtime/device/workload/protocol identity, prompt/output token accounting, batch/concurrency, warmup and cache state, timing definition, request success/error counts and measured host utilization. Its scope is one of `host_engine`, `host_loopback_serving`, `tailscale_client`, or `agent_task_checker`. Preserve each independently. Host engine metrics exclude the external WAN but include engine/CPU work; literal GPU-kernel timing requires a different profiler protocol. Loopback includes HTTP/scheduler/serialization work. CPU-heavy task checking on the GPU host can contaminate throughput; isolate it or disclose the shared-resource profile.
+
+As soon as the benchmark completes, persist and deliver its `BenchmarkReceipt` and result artifact to the durable off-rental output sink; stream/copy required artifacts before instance destruction so they do not disappear with temporary disk. Do not wait for the deletion API or provider absence check to return before presenting the result. Report benchmark status and cleanup status independently: for example `benchmark=passed, cleanup=pending`. The supervisor continues retries and sends a separate cleanup receipt/update when instance and any separately billed volume are verified absent; unresolved cleanup remains visible with its IDs and cost exposure. Cleanup failure does not erase a completed benchmark result, and a benchmark failure does not skip cleanup.
+
+Use the selected runtime's supported benchmark; if that runtime is vLLM, its official engine/serving/startup tools may provide throughput, TTFT, token/inter-token time and end-to-end JSON metrics. Pin the protocol/version; another runtime's result cannot become exact-model evidence. [vLLM benchmarks](https://docs.vllm.ai/en/latest/api/vllm/benchmarks/), [serving metrics](https://docs.vllm.ai/en/latest/cli/bench/serve/)
+
+Remote PC/Gravebuster/Mac results retain actual client identity, endpoint, Tailscale direct/peer-relay/DERP observations, path changes, latency/concurrency and time interval. Tailscale diagnostics establish route observations, not inference performance. A WAN result or subtraction of ping time cannot produce host GPU throughput. Preserve client CPU saturation as a limitation. [Tailscale diagnostics](https://tailscale.com/docs/reference/troubleshooting/poor-performance-tailnet)
+
+`TrafficObservation` records direction, scope (`serialized_application`, `transport_counter`, `provider_usage`, `provider_charge`), exact integer byte counts when available, counter/namespace/interface, interval/reset/wrap handling, retries, source and limitations. Transport includes headers/encryption/acknowledgments/retransmission and other traffic within its scope. Provider accounting can be delayed or rounded. Tokens cannot substitute for byte counts; application bytes/counter deltas are not exact billed bytes. Missing counters remain unknown and never expose task-private payload captures in public artifacts.
+
+## Authority and local state
+
+Version contracts in this repository; pin adopter versions. Store source captures, requests, private lease journals, logs, and reports in a configured ignored state directory, not the public GitHub cache. GitHub is the durable code/instruction source, while a local durable journal owns active instance obligations. A copied checkpoint cannot substitute for the actual journal.
+
+Follow [checkpoint-policy.md](checkpoint-policy.md) for development progression and adopter checkpoints. A public checkpoint reports capability and evidence without API credentials or account-private lease data.

@@ -1,0 +1,36 @@
+{
+  "schema_version": "content-generation.review-rubric.v1",
+  "dimensions": [
+    {
+      "id": "human_comprehension",
+      "question": "Can a new reader explain why evidence and owner limits precede GPU creation?",
+      "weight": 2
+    },
+    {
+      "id": "specificity",
+      "question": "Does the output name concrete model, price, storage, network, and cleanup details where evidence supports them?",
+      "weight": 2
+    },
+    {
+      "id": "claim_safety",
+      "question": "Are current capability claims tied to revision-pinned evidence and separated from planned work?",
+      "weight": 3
+    },
+    {
+      "id": "skimmability",
+      "question": "Can the reader find the current state, boundary, and next action quickly?",
+      "weight": 1
+    },
+    {
+      "id": "visual_clarity",
+      "question": "Does each diagram make one workflow or boundary easier to understand?",
+      "weight": 2
+    },
+    {
+      "id": "responsive_fit",
+      "question": "Can the flow and its labels be read at the widths declared for the asset?",
+      "weight": 1
+    }
+  ],
+  "decision_rule": "Accept only when claim_safety passes and no weighted dimension is below 3/5; human review can override model scores with a recorded reason."
+}

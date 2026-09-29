@@ -1,0 +1,81 @@
+{
+  "$id": "https://project-continuity.dev/schema/v1/documents.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "documents": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^[a-z0-9][a-z0-9._-]*$",
+            "type": "string"
+          },
+          "keywords": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "related": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+    "reviewed_commit": {
+            "pattern": "^(uncommitted|[a-f0-9]{40,64})$",
+            "type": "string"
+          },
+          "reviewed_sha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "summary": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "tasks": {
+            "items": {
+              "pattern": "^[A-Z][A-Z0-9]*-[0-9]{4}$",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path",
+          "title",
+          "summary",
+          "keywords",
+          "related",
+          "tasks",
+          "reviewed_commit",
+          "reviewed_sha256"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema": {
+      "const": "project-continuity.documents.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "documents"
+  ],
+  "title": "Continuity document inventory v1",
+  "type": "object"
+}

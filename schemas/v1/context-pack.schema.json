@@ -1,0 +1,54 @@
+{
+  "$id": "https://project-continuity.dev/schema/v1/context-pack.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "commit": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "generated_at": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "protocol_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "repository": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "const": "project-continuity.context-pack.v1"
+    },
+    "sources": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 3,
+      "type": "array"
+    },
+    "task_id": {
+      "pattern": "^[A-Z][A-Z0-9]*-[0-9]{4}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "protocol_version",
+    "repository",
+    "ref",
+    "commit",
+    "task_id",
+    "generated_at",
+    "sources"
+  ],
+  "title": "Context pack metadata v1",
+  "type": "object"
+}

@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
+  actions: write
 
 concurrency:
   group: vast-offer-snapshot
@@ -17,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -24,14 +28,56 @@ jobs:
         env:
           VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
         run: python scripts/sync_offers.py
-      - name: Commit changed snapshot
+      - name: Create or update the snapshot pull request
+        id: snapshot-pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: automation/vast-offer-snapshot
+          delete-branch: false
+          add-paths: data/latest.json
+          commit-message: "Refresh Vast.ai offer snapshot"
+          title: "Refresh Vast.ai offer snapshot"
+          body: |
+            Automated, read-only marketplace snapshot refresh.
+
+            - Source: Vast.ai `POST /api/v0/bundles`
+            - Snapshot timestamp and per-type counts: see `data/latest.json`
+            - Verification, rentable, and rented states are not filtered.
+            - Any result type at the API limit is marked possibly truncated.
+
+            This pull request requires the `gates` workflow before merge.
+      - name: Dispatch and wait for gates on the pull request revision
+        if: steps.snapshot-pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ steps.snapshot-pr.outputs.pull-request-branch }}
+          PR_SHA: ${{ steps.snapshot-pr.outputs.pull-request-head-sha }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/latest.json
-          if git diff --cached --quiet; then
-            echo "Offer snapshot unchanged."
-          else
-            git commit -m "Refresh Vast.ai offer snapshot"
-            git push
+          set -euo pipefail
+          if [[ ! "$PR_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Snapshot PR did not provide a valid head SHA." >&2
+            exit 1
           fi
+          before_ids="$(gh run list --workflow ci.yml --commit "$PR_SHA" --event workflow_dispatch --limit 100 --json databaseId,headSha,event --jq "[.[] | select(.headSha == \"$PR_SHA\" and .event == \"workflow_dispatch\") | .databaseId]")"
+          gh workflow run ci.yml --ref "$PR_BRANCH"
+          run_id=""
+          for attempt in $(seq 1 30); do
+            runs="$(gh run list --workflow ci.yml --commit "$PR_SHA" --event workflow_dispatch --limit 100 --json databaseId,headSha,event)"
+            fresh_matches="$(printf '%s' "$runs" | jq --arg sha "$PR_SHA" --argjson before "$before_ids" '[.[] | select(.headSha == $sha and .event == "workflow_dispatch") | select((.databaseId as $id | $before | index($id)) == null)]')"
+            match_count="$(printf '%s' "$fresh_matches" | jq 'length')"
+            if [ "$match_count" -gt 1 ]; then
+              echo "Multiple new gates runs match the snapshot PR SHA; refusing to guess." >&2
+              exit 1
+            elif [ "$match_count" -eq 1 ]; then
+              run_id="$(printf '%s' "$fresh_matches" | jq -r '.[0].databaseId')"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$run_id" ]; then
+            echo "Could not locate the dispatched gates run for the snapshot PR revision." >&2
+            exit 1
+          fi
+          gh run watch "$run_id" --exit-status

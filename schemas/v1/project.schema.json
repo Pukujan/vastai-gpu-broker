@@ -1,0 +1,30 @@
+{
+  "$id": "https://project-continuity.dev/schema/v1/project.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "type": "string"
+    },
+    "protocol_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "const": "project-continuity.project.v1"
+    },
+    "title": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "protocol_version",
+    "id",
+    "title"
+  ],
+  "title": "Project metadata v1",
+  "type": "object"
+}

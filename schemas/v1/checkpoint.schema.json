@@ -1,0 +1,84 @@
+{
+  "$id": "https://project-continuity.dev/schema/v1/checkpoint.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "agent": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "blocked": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "changed": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "completed": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "decisions": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "evidence": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "next_action": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "protocol_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "const": "project-continuity.checkpoint.v1"
+    },
+    "task_id": {
+      "pattern": "^[A-Z][A-Z0-9]*-[0-9]{4}$",
+      "type": "string"
+    },
+    "timestamp": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "protocol_version",
+    "task_id",
+    "timestamp",
+    "agent",
+    "completed",
+    "evidence",
+    "decisions",
+    "changed",
+    "blocked",
+    "next_action"
+  ],
+  "title": "Checkpoint metadata v1",
+  "type": "object"
+}

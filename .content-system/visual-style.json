@@ -1,0 +1,49 @@
+{
+  "schema_version": "content-generation.visual-style.v1",
+  "reference_asset": "docs/content-system-assets/Vast GPU Broker architecture.png",
+  "generation_workflow": "built-in image_gen",
+  "narrative_roles": [
+    "hero",
+    "problem",
+    "supporting",
+    "system",
+    "evidence",
+    "story",
+    "social"
+  ],
+  "palette": {
+    "background": "#F6F8FB",
+    "primary": "#14253D",
+    "accent": "#2868A8",
+    "warm_accent": "#BD7726",
+    "text": "#14253D",
+    "secondary": "#258477"
+  },
+  "subjects": [
+    "The stages that connect model evidence, live marketplace quotes, owner limits, bounded work, and cleanup"
+  ],
+  "composition": [
+    "One flow with a clear left-to-right reading order",
+    "Use functional labels with generous spacing",
+    "Mark target behavior as planned when implementation evidence is incomplete"
+  ],
+  "text_policy": "Use short, exact, functional labels in diagrams. Do not add invented metrics, provider UI, or claims of completed readiness.",
+  "roles": {
+    "system": {
+      "orientation": "wide",
+      "dimensions": "1600x650",
+      "crop_behavior": "Preserve the full five-stage flow; do not crop cards or arrows."
+    },
+    "evidence": {
+      "orientation": "wide",
+      "dimensions": "Set per asset",
+      "crop_behavior": "Keep source labels and uncertainty boundaries visible."
+    }
+  },
+  "reject_when": [
+    "The asset implies a paid run or verified cleanup that has not happened.",
+    "The diagram hides missing inputs, unknown terms, or incomplete retrieval.",
+    "The asset invents a price, capability, metric, or provider interface.",
+    "Labels cannot be read at the intended display size."
+  ]
+}

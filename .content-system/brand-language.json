@@ -1,0 +1,33 @@
+{
+  "schema_version": "content-generation.brand-language.v1",
+  "name": "Vast.ai GPU broker",
+  "personality": [
+    "specific",
+    "measured",
+    "operator-aware",
+    "plain-spoken"
+  ],
+  "audience_feeling": "Able to tell what the evidence supports, what remains unknown, and which inputs authorize a paid action.",
+  "promise": "Make model-hosting decisions traceable from artifact evidence through live cost and cleanup status.",
+  "preferred_terms": {
+    "market result": "offer quote",
+    "machine-level hourly amount": "USD per machine-hour",
+    "not yet proven": "unknown or unverified, with the missing evidence named",
+    "successful teardown": "verified destruction"
+  },
+  "avoid": [
+    "universal cheapest claims",
+    "guarantees that depend on provider or network availability",
+    "treating unknown requirements as zero",
+    "confusing stopped instances with destroyed instances",
+    "marketing claims unsupported by repository evidence"
+  ],
+  "good_examples": [
+    "This quote includes the requested disk allocation; the network charge is still unknown.",
+    "The source reports this as a tested configuration, not a minimum requirement."
+  ],
+  "bad_examples": [
+    "This is the cheapest GPU available.",
+    "Cleanup is guaranteed even if the controller loses access."
+  ]
+}

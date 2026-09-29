@@ -1,0 +1,29 @@
+{
+  "schema_version": "content-generation.filename-legend.v1",
+  "feature": "gpu-broker-architecture",
+  "module": "visual-direction",
+  "title": "GPU broker architecture image",
+  "glossary": [
+    {
+      "token": "Vast GPU Broker architecture",
+      "meaning": "The wide helper diagram showing the intended research, quote, limits, run, and cleanup sequence."
+    },
+    {
+      "token": "architecture",
+      "meaning": "Identifies this image as the product workflow diagram rather than a screenshot or offer snapshot."
+    }
+  ],
+  "rules_summary": [
+    "Use the human-readable product and purpose in the basename.",
+    "Keep content hashes in the manifest instead of the filename.",
+    "Do not use this helper graphic to imply implementation or paid-run readiness."
+  ],
+  "files": [
+    {
+      "path": "docs/content-system-assets/Vast GPU Broker architecture.png",
+      "identity": "Vast GPU Broker architecture",
+      "style": "speakable",
+      "note": "Planned workflow helper graphic."
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "$id": "https://project-continuity.dev/schema/v1/current.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "active_task": {
+      "pattern": "^[A-Z][A-Z0-9]*-[0-9]{4}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "active_task_file": {
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "protocol_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "const": "project-continuity.current.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "protocol_version",
+    "active_task",
+    "active_task_file"
+  ],
+  "title": "Current checkpoint metadata v1",
+  "type": "object"
+}

@@ -2,9 +2,9 @@
 
 ## Repository visibility
 
-Keep `vastai-gpu-broker` private while developing the credential and paid-action flows. A public repository can be safe for source code only when it contains no keys, encrypted secret payloads, private Drive links, account identifiers, or private offer/account data. Private visibility reduces accidental exposure; it is not a substitute for keeping secrets out of Git.
+`vastai-gpu-broker` is public by owner choice. Its source, documentation, issue tracker, and any committed offer snapshots are visible to everyone. Do not commit API keys, encrypted secret payloads, private Drive links, account identifiers, lease journals, or private account data. Public visibility does not make a repository an appropriate secret store.
 
-There is no separate vault repository or vault service in this project today. The existing repo is the Vast marketplace/broker project and is currently private.
+There is no separate vault repository or vault service in this project today. This repository is the Vast marketplace/broker project; it is public, while any future secret broker must remain separately authenticated and private.
 
 ## Can the service cold-start?
 
@@ -21,7 +21,7 @@ For any remotely hosted secret broker, require caller authentication on every re
 
 ## Current recommendation
 
-Do not build or host a custom all-keys vault yet. Pilot a managed vault CLI first; it avoids another service to deploy and secure. If a remote broker becomes necessary for agents on several computers, use an authenticated scale-to-zero host with a managed secret store and a local approval flow. Keep this source repository private during the pilot.
+Do not build or host a custom all-keys vault yet. Pilot a managed vault CLI first; it avoids another service to deploy and secure. If a remote broker becomes necessary for agents on several computers, use an authenticated scale-to-zero host with a managed secret store and a local approval flow. Keep that service and its secret store private; keep this public repository limited to source, public documentation, and deliberately public marketplace snapshots.
 
 ## Official hosting references
 
