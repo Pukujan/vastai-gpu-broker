@@ -28,6 +28,14 @@ The `search --filters` help called its input a JSON object, while the command re
 
 The last verified broker checkpoint still required two deployed recovery guardians in separate failure domains and their shared registry before paid creation. This smoke did not deploy or recheck those services. If that gate is still closed on resume, stop before spend and record its exact output.
 
+## Resume on the owner's second Mac (2026-09-29)
+
+The owner switched devices, raised the run cap to $2 total (still $0.20 per hour all-in, network around $1–2 per TB), forbade Cloudflare R2 for this day, and pointed to this machine's local Vast key. Resume steps 1–3 were completed: a fresh clone at `5c2090e`, the package installed from source with the recovery extra, and the key loaded into the process environment only. The key line on this device is named `vastai_api`; no `vastai_2` entry exists here, so the earlier checkpoint's key name did not carry over.
+
+The first read-only search failed: `search --filters` sends the JSON file to Vast unchanged, so constraint-style names are rejected with a masked HTTP 400. Only the native operator form works, for example `{"gpu_name":{"eq":"RTX 5060 Ti"},"num_gpus":{"gte":1},"gpu_ram":{"gte":15000}}`. With that shape the search returned 100 on-demand RTX 5060 Ti offers (one page, `complete=false`; 70 verified, 22 unverified, 8 deverified; cheapest verified offer $0.074/hour with preferred-tier network rates). The snapshot stayed local.
+
+The guarded `create` attempt then ran with the scoped credentials, control-host id, and a private journal directory all set, and with no guardian gate configured. It refused before any provider call, exit code 2, with exactly: `two remote recovery paths and their shared registry are not configured`. No proposal, no journal record, no instance, no charge. Per resume step 4 and the stop-before-spend rule above, the run ends here on this device. Two additional readiness gaps were recorded in `CURRENT.md`: the pinned recipe issues a single inference probe and cannot yet satisfy "live for at least three minutes", and the GPU preflight runs after billing has started.
+
 ## Record details
 
 - Owning task: VBR-0001, issue #1; parent: none.
