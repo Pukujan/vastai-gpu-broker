@@ -4,7 +4,7 @@ This repository is public. Treat all committed files, issues, workflow logs, and
 
 This repository contains a Python package for evidence-first model hosting decisions and temporary Vast.ai GPU leases. It can query current offers, validate supplied model evidence, compare costs under explicit limits, and includes a lease controller with a durable local journal and an independent cleanup supervisor.
 
-**The paid Open-Jev run is still blocked.** A `run-openjev` command now refreshes the offer through the router, binds the pinned 9B recipe and limits, and records the inference receipt and full-inventory cleanup evidence. It stops before creation unless scoped Vast credentials, finite owner limits, and a gate factory backed by two deployed cleanup paths and their shared registry are configured. This repository does not yet include those production recovery backends. No real Vast inference or cleanup challenge is claimed as tested.
+**The paid Open-Jev run is still blocked.** The `create` command refreshes the offer through the router, binds the pinned 9B recipe and limits, and records inference and cleanup evidence. It stops before creation unless scoped Vast credentials, finite owner limits, and two deployed cleanup paths backed by one shared registry are configured. The repository includes the recovery service and GitHub Actions adapters, but they have not been deployed or tested across real failure domains. No real Vast inference or cleanup challenge is claimed as tested.
 
 ## Install and adopt
 
@@ -84,6 +84,29 @@ vast-broker destroy your-request-id
 
 `status` refreshes the full Vast instance and volume inventories and shows only resources owned by that request. `destroy` acts only on IDs recorded in the private broker journal, then verifies provider-side absence; it rejects untracked IDs. `search` performs the same live read-only offer query as the `offers` alias.
 
+The importable Python facade is `VastRentaiService` (`from vast_broker import VastRentaiService`). It exposes `search()`, guarded `create()`, journal-scoped `status(request_id)`, and `destroy(request_id)`. `create()` is reusable for any proposal produced by the router when the caller supplies the matching confirmation digest, a freshly rebuilt identical proposal, its exact lease plan, and trusted bounded installer/inference code; it still requires the two-guardian gate. The CLI's `create` name remains the Open-Jev 9B trial command, while the Python method is the generic guarded lifecycle entry point.
+
+```python
+from vast_broker import LeaseJournal, VastOffersClient, VastRentaiService
+
+service = VastRentaiService(
+    provider=VastOffersClient(api_key=lease_key),
+    search_client=VastOffersClient(api_key=read_key),
+    journal=LeaseJournal(private_journal_dir),
+    guardian_gate=ready_two_guardian_gate,
+)
+offers = service.search(filters, disk_gb=allocated_disk_gb)
+# Build and refresh a router proposal from evidence and current offers before create.
+lease = service.create(
+    proposal, confirmation_digest, current_proposal=fresh_proposal,
+    plan=exact_lease_plan, operation=trusted_bounded_operation,
+)
+state = service.status(proposal["request_id"])
+cleanup = service.destroy(proposal["request_id"])
+```
+
+`read_key`, `lease_key`, the gate, proposal, plan, and operation above are locally configured application objects. The search key should be read-only; the lifecycle key needs only the provider permissions required for instance/volume reads and writes. `destroy()` requires the same private journal and never accepts arbitrary Vast IDs.
+
 The command can report `OPENJEV_LIVE_TEST_PASSED` only when the pinned server returns a valid choice distribution and the same attempt's fresh complete Vast instance inventory plus volume listing confirm that all owned resources are absent. A passing test suite or a blocked command is not a completed GPU challenge.
 
 ## Read-only and paid-capable entry points
@@ -110,9 +133,11 @@ An adopter wiring the paid API must configure an independent provider factory (`
 
 Deadlines and cost calculations are local controls and estimates. Vast does not document a per-lease maximum lifetime or per-task spend/network cap. The broker must actively destroy a lease after use; it does not wait for account balance depletion. Vast's zero-credit behavior is only a billing fact: disk charges can continue, balances can go negative during a grace buffer, and saved-card charging may apply. A controller, host, or network outage can still prevent prompt cleanup; only fresh provider-confirmed absence establishes that an instance was removed. See [billing and cleanup behavior](docs/official-docs.md#cost-and-instance-lifecycle), [architecture](docs/architecture.md), and the [lease supervisor failure requirements](docs/SDD.md#state-machine-and-durable-lease-ownership).
 
+The HTTP worker and GitHub backup path need separate deployments and scoped secrets. See the [remote guardian setup guide](docs/remote-guardians.md) for their environment and verification steps.
+
 ## Current blockers and evidence
 
-- The Open-Jev CLI has a source-pinned installation and inference recipe, but the required production recovery backends and their failure-injection proof are not implemented or deployed.
+- The Open-Jev CLI has a source-pinned installation and inference recipe. The recovery service and GitHub Actions adapter are implemented, but neither is deployed and physical failure-domain recovery has not been tested.
 - The CLI `route` command consumes supplied request, evidence, market, and limit files; automatic research capture and an end-to-end fresh-plan-and-confirm loop are not provided.
 - The Python lease/provider APIs can create resources outside `authorize_run` when directly invoked, so safe use depends on the adopter calling the router gate first.
 - Existing automated lifecycle tests use fakes. No paid model install, real inference, provider spend cap, or real Vast cleanup challenge is claimed as tested.

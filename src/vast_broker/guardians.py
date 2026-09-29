@@ -156,6 +156,8 @@ class LeaseRegistrySnapshot:
     guardian_acks: tuple[GuardianAck, ...] = ()
     owned_instance_ids: tuple[str, ...] = ()
     owned_volume_ids: tuple[str, ...] = ()
+    cleanup_requested: bool = False
+    cleanup_requested_at_epoch: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +188,7 @@ class GuardianRecoveryReceipt:
     provider_absence_confirmed: bool = False
     alert_receipt_id: str | None = None
     hard_deletion_guaranteed: bool = False
+    observed_at_epoch: float | None = None
 
 
 class GuardianReadinessError(RuntimeError):
@@ -225,6 +228,7 @@ class SharedLeaseRegistry(Protocol):
         instance_ids: tuple[str, ...],
         volume_ids: tuple[str, ...],
     ) -> LeaseRegistrySnapshot: ...
+    def request_cleanup(self, *, request_id: str, operation_fence: int) -> LeaseRegistrySnapshot: ...
 
 
 class RecoveryGuardian(Protocol):
@@ -409,6 +413,70 @@ class GuardianReadinessGate:
                 cleanup_required=True,
             ) from None
 
+    def request_cleanup(self, request_id: str, operation_fence: int) -> LeaseRegistrySnapshot:
+        """Persist an early signal and wake any guardian with push support."""
+        registry = self.registry
+        if registry is None:
+            raise GuardianReadinessError(
+                "shared_registry_unavailable_after_create",
+                "shared lease registry is unavailable; remote cleanup remains pending",
+                cleanup_required=True,
+            )
+        try:
+            current = registry.read(request_id)
+            if (
+                not isinstance(current, LeaseRegistrySnapshot)
+                or current.request_id != request_id
+                or current.operation_fence != operation_fence
+                or not current.intent_digest
+            ):
+                raise ValueError("fenced lease record is missing or mismatched")
+            updated = registry.request_cleanup(
+                request_id=request_id, operation_fence=operation_fence,
+            )
+            readback = registry.read(request_id)
+        except Exception:
+            raise GuardianReadinessError(
+                "cleanup_request_publication_failed",
+                "shared registry could not persist and read back the cleanup request",
+                cleanup_required=True,
+            ) from None
+        if (
+            not isinstance(updated, LeaseRegistrySnapshot)
+            or not isinstance(readback, LeaseRegistrySnapshot)
+            or updated.request_id != request_id
+            or readback.request_id != request_id
+            or updated.operation_fence != operation_fence
+            or readback.operation_fence != operation_fence
+            or (
+                readback.state != RecoveryState.VERIFIED_ABSENT.value
+                and (not updated.cleanup_requested or not readback.cleanup_requested)
+            )
+            or updated.intent_digest != readback.intent_digest
+        ):
+            raise GuardianReadinessError(
+                "cleanup_request_readback_failed",
+                "shared registry did not retain the fenced cleanup request",
+                cleanup_required=True,
+            )
+        dispatch_failed = False
+        if readback.state != RecoveryState.VERIFIED_ABSENT.value:
+            for guardian in self.guardians:
+                wake = getattr(guardian, "request_cleanup", None)
+                if not callable(wake):
+                    continue
+                try:
+                    wake(request_id=request_id, operation_fence=operation_fence)
+                except Exception:
+                    dispatch_failed = True
+        if dispatch_failed:
+            raise GuardianReadinessError(
+                "remote_cleanup_dispatch_failed",
+                "a recovery guardian did not accept the early cleanup dispatch; the durable signal remains available for scheduled recovery",
+                cleanup_required=True,
+            )
+        return readback
+
     def _eligible_guardians(self, intent: LeaseCreateIntent) -> list[tuple[RecoveryGuardian, GuardianDescriptor]]:
         eligible: list[tuple[RecoveryGuardian, GuardianDescriptor]] = []
         for guardian in self.guardians:
@@ -464,6 +532,18 @@ class GuardianReadinessGate:
             raise GuardianReadinessError("registry_readback_failed", "shared registry returned no valid lease record")
         if snapshot.durable is not True or snapshot.registry_id != registry_id:
             raise GuardianReadinessError("registry_readback_failed", "shared registry durability or identity could not be verified")
+        if not isinstance(snapshot.cleanup_requested, bool):
+            raise GuardianReadinessError("registry_cleanup_request_invalid", "shared registry cleanup request flag is malformed")
+        requested_at = snapshot.cleanup_requested_at_epoch
+        if requested_at is not None and (
+            isinstance(requested_at, bool)
+            or not isinstance(requested_at, (int, float))
+            or not math.isfinite(requested_at)
+            or requested_at <= 0
+        ):
+            raise GuardianReadinessError("registry_cleanup_request_invalid", "shared registry cleanup request timestamp is malformed")
+        if snapshot.cleanup_requested != (requested_at is not None):
+            raise GuardianReadinessError("registry_cleanup_request_invalid", "shared registry cleanup request flag and timestamp disagree")
         if snapshot.request_id != intent.request_id:
             raise GuardianReadinessError("registry_request_mismatch", "shared registry returned a different request")
         if snapshot.operation_fence != intent.operation_fence:
@@ -602,6 +682,13 @@ def validate_guardian_recovery_receipt(
         fail("recovery_receipt_mismatch", "guardian recovery receipt does not match the request fence and guardian")
     if receipt.hard_deletion_guaranteed is not False:
         fail("hard_deletion_claim_rejected", "a guardian cannot claim provider-enforced or hard deletion")
+    if receipt.observed_at_epoch is not None and (
+        isinstance(receipt.observed_at_epoch, bool)
+        or not isinstance(receipt.observed_at_epoch, (int, float))
+        or not math.isfinite(receipt.observed_at_epoch)
+        or receipt.observed_at_epoch <= 0
+    ):
+        fail("recovery_observation_time_invalid", "guardian recovery observation time is malformed")
     if not isinstance(receipt.alert_receipt_id, str) or not receipt.alert_receipt_id.strip():
         fail("recovery_alert_missing", "guardian recovery must retain an alert or completion receipt")
 

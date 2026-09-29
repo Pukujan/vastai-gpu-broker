@@ -33,11 +33,18 @@ class FakeSupervisor:
 
 
 class FakeGuardianGate:
-    def __init__(self, fail_arm: bool = False, fail_publish: bool = False):
+    def __init__(self, fail_arm: bool = False, fail_publish: bool = False, fail_cleanup_signal: bool = False):
         self.fail_arm = fail_arm
         self.fail_publish = fail_publish
+        self.fail_cleanup_signal = fail_cleanup_signal
         self.armed: list[Any] = []
         self.published: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+        self.cleanup_requests: list[tuple[str, int]] = []
+
+    def request_cleanup(self, request_id, operation_fence):
+        self.cleanup_requests.append((request_id, operation_fence))
+        if self.fail_cleanup_signal:
+            raise RuntimeError("remote cleanup dispatch failed")
 
     def arm_before_create(self, intent):
         if self.fail_arm:
@@ -210,6 +217,7 @@ def test_create_intent_is_durable_before_remote_create_and_success_is_verified(t
     assert observed == [("CREATE_IN_PROGRESS", [])]
     assert guardian_gate.armed[0].deadline_epoch == journal.load("request-1")["hard_deadline_epoch"]
     assert result["state"] == "DESTROYED"
+    assert guardian_gate.cleanup_requests == [("request-1", guardian_gate.armed[0].operation_fence)]
     assert provider.instances == {}
     assert provider.volumes == {}
     assert provider.cleanup_events == [("instance", "1"), ("volume", "901")]
@@ -225,6 +233,20 @@ def test_create_intent_is_durable_before_remote_create_and_success_is_verified(t
     assert saved["absence_evidence"]["instance_inventory"]["instance_count"] == 0
     assert len(saved["absence_evidence"]["instance_inventory"]["instance_ids_sha256"]) == 64
     assert observed_at_destroy == [("ok", saved["operation_result_sha256"])]
+
+
+def test_remote_cleanup_signal_failure_does_not_block_local_teardown(tmp_path):
+    provider = FakeProvider()
+    journal = LeaseJournal(tmp_path)
+    gate = FakeGuardianGate(fail_cleanup_signal=True)
+    result = LeaseController(
+        provider, journal, FakeSupervisor(), guardian_gate=gate,
+    ).run("remote-signal-outage", plan(), lambda _: "done")
+
+    assert result["state"] == "DESTROYED"
+    assert provider.instances == {}
+    saved = journal.load("remote-signal-outage")
+    assert saved["guardian_cleanup_signal_error_type"] == "RuntimeError"
 
 
 def test_unrecordable_operation_result_fails_the_trial_but_still_destroys(tmp_path):

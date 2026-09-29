@@ -6,7 +6,7 @@ The implementation target is a portable Python module and CLI sharing one resear
 
 ## Current status
 
-The existing marketplace synchronizer is implemented. The runner, executable research/budget gates, remote setup/probe, finite bidding, durable journal and independent cleanup supervisor are implementation targets. Consult the current continuity/checkpoint projection for actual completed capability; this architecture does not itself enable paid actions.
+The Python broker, marketplace client, research and budget gates, pinned Open-Jev runner, durable lease journal, local supervisor, and remote recovery service adapters are implemented. Paid use remains blocked until two remote paths and their shared registry are deployed and tested in separate failure domains. Consult the current continuity/checkpoint projection for actual evidence; this architecture does not itself enable paid actions.
 
 ## Component boundaries
 
