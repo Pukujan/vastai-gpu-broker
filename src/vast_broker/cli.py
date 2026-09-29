@@ -337,6 +337,10 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("--disk-gb", type=float, help="disk allocation used for price statistics")
     search.add_argument("--page-size", type=int, default=100)
     search.add_argument("--max-pages", type=int, default=20)
+    search.add_argument(
+        "--rental-type", choices=("ondemand", "bid", "reserved"), action="append",
+        help="rental type to include; may be repeated (default: all three)",
+    )
     search.add_argument("--output", help="write normalized offers to this path")
 
     trial = commands.add_parser(
@@ -376,13 +380,17 @@ def main(argv: list[str] | None = None) -> int:
             # research/input gates. They are not process failures.
             return 0
         if args.command in {"offers", "search"}:
-            if not os.environ.get("VAST_API_KEY"):
-                raise ValueError("VAST_API_KEY must be supplied by the configured secret store")
+            api_key = os.environ.get("VAST_BROKER_SEARCH_API_KEY") or os.environ.get("VAST_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    "VAST_BROKER_SEARCH_API_KEY (or legacy VAST_API_KEY) must be supplied by the configured secret store"
+                )
             filters = _read_json(args.filters) if args.filters else {}
             if not isinstance(filters, dict):
                 raise ValueError("filters file must contain a JSON object")
-            result = VastRentaiService(search_client=VastOffersClient()).search(
+            result = VastRentaiService(search_client=VastOffersClient(api_key=api_key)).search(
                 filters, page_size=args.page_size, max_pages=args.max_pages, disk_gb=args.disk_gb,
+                rental_types=tuple(args.rental_type or ("ondemand", "bid", "reserved")),
             )
             _write_json(result, args.output)
             return 0
