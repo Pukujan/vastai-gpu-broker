@@ -15,7 +15,7 @@ The GitHub issue owns overall acceptance. Child issues #2–#4 cover research, m
 
 ## Next checkpoint
 
-Publish the live-run report, local Vast API/usage guide, and current checkpoint through the required `gates` PR path. Then continue the remaining guardian and multi-model acceptance work.
+Deploy and test two cleanup services in separate failure domains against the shared registry. Then continue the multi-model, bid-race, guardian failure-injection, and private-evaluator acceptance work.
 
 
 ## Checkpoint log
