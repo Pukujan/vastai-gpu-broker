@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import time
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -47,6 +49,7 @@ def _recovery_from_dict(item: dict[str, Any]) -> GuardianRecoveryReceipt:
         provider_absence_confirmed=item.get("provider_absence_confirmed") is True,
         alert_receipt_id=item.get("alert_receipt_id"),
         hard_deletion_guaranteed=item.get("hard_deletion_guaranteed") is True,
+        observed_at_epoch=item.get("observed_at_epoch"),
     )
 
 
@@ -84,6 +87,7 @@ def _recovery_to_dict(receipt: GuardianRecoveryReceipt) -> dict[str, Any]:
         "provider_absence_confirmed": receipt.provider_absence_confirmed,
         "alert_receipt_id": receipt.alert_receipt_id,
         "hard_deletion_guaranteed": receipt.hard_deletion_guaranteed,
+        "observed_at_epoch": receipt.observed_at_epoch,
     }
 
 
@@ -192,6 +196,19 @@ class R2SharedLeaseRegistry:
     def _snapshot(self, row: dict[str, Any] | None) -> LeaseRegistrySnapshot | None:
         if row is None or row.get("state") == "FENCE_RESERVED":
             return None
+        cleanup_requested = row.get("cleanup_requested", False)
+        cleanup_requested_at = row.get("cleanup_requested_at_epoch")
+        if not isinstance(cleanup_requested, bool):
+            raise R2RegistryError("R2 cleanup request flag is malformed")
+        if cleanup_requested_at is not None and (
+            isinstance(cleanup_requested_at, bool)
+            or not isinstance(cleanup_requested_at, (int, float))
+            or not math.isfinite(cleanup_requested_at)
+            or cleanup_requested_at <= 0
+        ):
+            raise R2RegistryError("R2 cleanup request timestamp is malformed")
+        if cleanup_requested != (cleanup_requested_at is not None):
+            raise R2RegistryError("R2 cleanup request flag and timestamp disagree")
         return LeaseRegistrySnapshot(
             registry_id=row["registry_id"], request_id=row["request_id"],
             operation_fence=row["operation_fence"], intent_digest=row["intent_digest"],
@@ -203,6 +220,8 @@ class R2SharedLeaseRegistry:
             guardian_acks=tuple(_ack_from_dict(item) for item in row.get("guardian_acks", [])),
             owned_instance_ids=tuple(row.get("owned_instance_ids", [])),
             owned_volume_ids=tuple(row.get("owned_volume_ids", [])),
+            cleanup_requested=cleanup_requested,
+            cleanup_requested_at_epoch=cleanup_requested_at,
         )
 
     def reserve_fence(self, *, request_id: str, attempt_id: str, operation_fence: int) -> FenceReservation:
@@ -225,6 +244,7 @@ class R2SharedLeaseRegistry:
                     "attempt_id": attempt_id, "operation_fence": operation_fence,
                     "state": "FENCE_RESERVED", "revision": row.get("revision", 0) + 1,
                     "guardian_acks": [], "owned_instance_ids": [], "owned_volume_ids": [],
+                    "cleanup_requested": False, "cleanup_requested_at_epoch": None,
                     "recovery_receipts": [],
                 }
                 try:
@@ -240,6 +260,7 @@ class R2SharedLeaseRegistry:
                     "attempt_id": attempt_id, "operation_fence": operation_fence,
                     "state": "FENCE_RESERVED", "revision": 1,
                     "guardian_acks": [], "owned_instance_ids": [], "owned_volume_ids": [],
+                    "cleanup_requested": False, "cleanup_requested_at_epoch": None,
                     "recovery_receipts": [],
                 }, etag=None, create_only=True)
                 return FenceReservation(self.registry_id, request_id, attempt_id, operation_fence, True)
@@ -339,6 +360,36 @@ class R2SharedLeaseRegistry:
                 if "compare-and-swap" not in str(exc):
                     raise
         raise R2RegistryError("R2 registry remained busy while publishing owned resources")
+
+    def request_cleanup(self, *, request_id: str, operation_fence: int) -> LeaseRegistrySnapshot:
+        """Durably signal early cleanup without conflating it with recovery status."""
+        if isinstance(operation_fence, bool) or not isinstance(operation_fence, int) or operation_fence < 1:
+            raise ValueError("operation_fence must be positive")
+        for _ in range(self.cas_attempts):
+            row, etag = self._read(request_id)
+            if (
+                row is None
+                or row.get("operation_fence") != operation_fence
+                or row.get("state") == "FENCE_RESERVED"
+            ):
+                raise R2RegistryError("cleanup request has no matching published lease fence")
+            if row.get("state") == RecoveryState.VERIFIED_ABSENT.value:
+                return self._snapshot(row)  # type: ignore[return-value]
+            if row.get("state") not in {"CREATE_INTENT", "LEASE_OWNED", "CLEANUP_PENDING"}:
+                raise R2RegistryError("cleanup request cannot be added to this lease state")
+            if row.get("cleanup_requested") is True:
+                snapshot = self._snapshot(row)
+                return snapshot  # type: ignore[return-value]
+            row["cleanup_requested"] = True
+            row["cleanup_requested_at_epoch"] = time.time()
+            row["revision"] += 1
+            try:
+                self._write(request_id, row, etag=etag)
+                return self._snapshot(row)  # type: ignore[return-value]
+            except R2RegistryError as exc:
+                if "compare-and-swap" not in str(exc):
+                    raise
+        raise R2RegistryError("R2 registry remained busy while publishing cleanup request")
 
     def list_records(self, *, include_terminal: bool = False) -> list[dict[str, Any]]:
         prefix = f"{self.prefix}leases/"

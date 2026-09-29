@@ -1,0 +1,73 @@
+name: Vast remote recovery guardian
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Recovery action
+        required: true
+        type: choice
+        options: [sweep, acknowledge, reconcile]
+        default: sweep
+      request_id:
+        description: Fenced lease request ID
+        required: false
+        type: string
+      operation_fence:
+        description: Fenced operation number
+        required: false
+        type: string
+      intent_digest:
+        description: CREATE_INTENT digest for acknowledgement
+        required: false
+        type: string
+      registry_id:
+        description: Shared registry identity for acknowledgement
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vast-guardian-${{ github.event.inputs.request_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: vars.VAST_BROKER_GUARDIAN_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VAST_API_KEY: ${{ secrets.VAST_BROKER_GITHUB_VAST_API_KEY }}
+      VAST_BROKER_R2_BUCKET: ${{ secrets.VAST_BROKER_R2_BUCKET }}
+      VAST_BROKER_R2_ENDPOINT: ${{ secrets.VAST_BROKER_R2_ENDPOINT }}
+      VAST_BROKER_R2_ACCESS_KEY_ID: ${{ secrets.VAST_BROKER_R2_ACCESS_KEY_ID }}
+      VAST_BROKER_R2_SECRET_ACCESS_KEY: ${{ secrets.VAST_BROKER_R2_SECRET_ACCESS_KEY }}
+      VAST_BROKER_R2_ACCOUNT_ID: ${{ secrets.VAST_BROKER_R2_ACCOUNT_ID }}
+      VAST_BROKER_GUARDIAN_ID: github-actions-recovery
+      VAST_BROKER_CONTROL_HOST_ID: github-hosted-runner
+      VAST_BROKER_FAILURE_DOMAIN_ID: github-actions
+      VAST_BROKER_ALERT_WEBHOOK_URL: ${{ secrets.VAST_BROKER_ALERT_WEBHOOK_URL }}
+      VAST_BROKER_ALERT_WEBHOOK_TOKEN: ${{ secrets.VAST_BROKER_ALERT_WEBHOOK_TOKEN }}
+      VAST_BROKER_GUARDIAN_ACTION: ${{ inputs.action || 'sweep' }}
+      VAST_BROKER_GUARDIAN_REQUEST_ID: ${{ inputs.request_id }}
+      VAST_BROKER_GUARDIAN_OPERATION_FENCE: ${{ inputs.operation_fence }}
+      VAST_BROKER_GUARDIAN_INTENT_DIGEST: ${{ inputs.intent_digest }}
+      VAST_BROKER_GUARDIAN_REGISTRY_ID: ${{ inputs.registry_id }}
+    steps:
+      - name: Check out trusted default-branch code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install recovery service
+        run: python -m pip install ".[recovery]"
+      - name: Reconcile fenced lease or acknowledge dispatch
+        run: python -m vast_broker.guardian_tasks

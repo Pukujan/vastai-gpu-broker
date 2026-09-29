@@ -122,6 +122,27 @@ def test_r2_round_trips_url_sensitive_request_ids_and_lists_them():
     assert records[0]["request_id"] == request_id
 
 
+def test_cleanup_request_is_fenced_durable_and_idempotent():
+    registry = make_registry()
+    intent = publish_owned_lease(registry, "openjev/cleanup-signal")
+
+    first = registry.request_cleanup(
+        request_id=intent.request_id, operation_fence=intent.operation_fence,
+    )
+    second = registry.request_cleanup(
+        request_id=intent.request_id, operation_fence=intent.operation_fence,
+    )
+
+    assert first.cleanup_requested is True
+    assert first.cleanup_requested_at_epoch is not None
+    assert second.cleanup_requested is True
+    assert second.cleanup_requested_at_epoch == first.cleanup_requested_at_epoch
+    assert second.state == "LEASE_OWNED"
+    assert registry.read(intent.request_id).cleanup_requested is True
+    with pytest.raises(R2RegistryError, match="matching published lease fence"):
+        registry.request_cleanup(request_id=intent.request_id, operation_fence=8)
+
+
 def test_one_guardian_receipt_cannot_finalize_cleanup_or_allow_a_new_fence():
     registry = make_registry()
     request_id = "openjev/one-receipt"

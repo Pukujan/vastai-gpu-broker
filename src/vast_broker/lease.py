@@ -837,6 +837,30 @@ class LeaseController:
         raise LeaseError("instance did not start before its bounded deadline", self.status(request_id) or {})
 
     def _cleanup_request(self, request_id: str) -> dict[str, Any] | None:
+        # Tell the independent recovery paths before local cleanup starts. If the
+        # shared registry is down, local cleanup still proceeds and the bounded
+        # lease deadline remains the guardians' fallback trigger.
+        operation_fence: int | None = None
+        with self.journal.locked(request_id):
+            initial = self.journal.load(request_id)
+            if not initial:
+                return None
+            if initial.get("state") in {"DESTROYED", "FAILED_CLEAN"}:
+                return initial
+            value = initial.get("operation_fence")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                operation_fence = value
+        request_cleanup = getattr(self.guardian_gate, "request_cleanup", None)
+        if operation_fence is not None and callable(request_cleanup):
+            try:
+                request_cleanup(request_id, operation_fence)
+            except Exception as exc:
+                with self.journal.locked(request_id):
+                    current = self.journal.load(request_id)
+                    if current and current.get("state") not in {"DESTROYED", "FAILED_CLEAN"}:
+                        current["guardian_cleanup_signal_error_type"] = type(exc).__name__
+                        self.journal.save(current)
+
         with self.journal.locked(request_id):
             record = self.journal.load(request_id)
             if not record:
