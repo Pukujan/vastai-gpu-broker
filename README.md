@@ -133,6 +133,8 @@ An adopter wiring the paid API must configure an independent provider factory (`
 
 Deadlines and cost calculations are local controls and estimates. Vast does not document a per-lease maximum lifetime or per-task spend/network cap. The broker must actively destroy a lease after use; it does not wait for account balance depletion. Vast's zero-credit behavior is only a billing fact: disk charges can continue, balances can go negative during a grace buffer, and saved-card charging may apply. A controller, host, or network outage can still prevent prompt cleanup; only fresh provider-confirmed absence establishes that an instance was removed. See [billing and cleanup behavior](docs/official-docs.md#cost-and-instance-lifecycle), [architecture](docs/architecture.md), and the [lease supervisor failure requirements](docs/SDD.md#state-machine-and-durable-lease-ownership).
 
+The HTTP worker and GitHub backup path need separate deployments and scoped secrets. See the [remote guardian setup guide](docs/remote-guardians.md) for their environment and verification steps.
+
 ## Current blockers and evidence
 
 - The Open-Jev CLI has a source-pinned installation and inference recipe. The recovery service and GitHub Actions adapter are implemented, but neither is deployed and physical failure-domain recovery has not been tested.
