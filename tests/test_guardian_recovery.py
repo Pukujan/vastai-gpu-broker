@@ -78,14 +78,33 @@ class ProviderControl:
 
     def __init__(self, path: Path):
         self.path = path
-        _atomic_json_write(path, {"network_available": True, "vast_available": True})
+        _atomic_json_write(
+            path,
+            {
+                "network_available": True,
+                "vast_available": True,
+                "instance_listing_available": True,
+                "volume_listing_available": True,
+            },
+        )
 
-    def set_outage(self, *, network: bool | None = None, vast: bool | None = None) -> None:
+    def set_outage(
+        self,
+        *,
+        network: bool | None = None,
+        vast: bool | None = None,
+        instance_listing: bool | None = None,
+        volume_listing: bool | None = None,
+    ) -> None:
         state = _read_json(self.path)
         if network is not None:
             state["network_available"] = network
         if vast is not None:
             state["vast_available"] = vast
+        if instance_listing is not None:
+            state["instance_listing_available"] = instance_listing
+        if volume_listing is not None:
+            state["volume_listing_available"] = volume_listing
         _atomic_json_write(self.path, state)
 
     def get(self) -> dict[str, bool]:
@@ -221,6 +240,9 @@ class FileBackedFencedRegistry:
             intent_digest=record["intent_digest"],
             state=record["state"],
             deadline_epoch=record["deadline_epoch"],
+            attempt_label=record["attempt_label"],
+            preexisting_instance_ids=tuple(record["preexisting_instance_ids"]),
+            preexisting_volume_ids=tuple(record["preexisting_volume_ids"]),
             durable=record["durable"],
             revision=record["revision"],
             guardian_acks=acks,
@@ -277,10 +299,14 @@ class FileProviderClient:
 
     def list_instances(self) -> list[dict[str, Any]]:
         self._require_api()
+        if not _read_json(self.control_path)["instance_listing_available"]:
+            raise TimeoutError("fake provider instance listing is unavailable")
         return [dict(row) for row in self.truth.read()["instances"].values()]
 
     def list_volumes(self) -> list[dict[str, Any]]:
         self._require_api()
+        if not _read_json(self.control_path)["volume_listing_available"]:
+            raise TimeoutError("fake provider volume listing is unavailable")
         return [dict(row) for row in self.truth.read()["volumes"].values()]
 
     def get_instance(self, instance_id: str) -> dict[str, Any] | None:
@@ -427,14 +453,135 @@ class FileRecoveryGuardian:
         if not record or record.operation_fence != operation_fence:
             return self._pending(request_id, operation_fence, alert_id, (), ())
 
+        preexisting_instances = set(record.preexisting_instance_ids)
+        preexisting_volumes = set(record.preexisting_volume_ids)
+        if (set(record.owned_instance_ids) & preexisting_instances
+                or set(record.owned_volume_ids) & preexisting_volumes):
+            return self._pending(
+                request_id,
+                operation_fence,
+                alert_id,
+                record.owned_instance_ids,
+                record.owned_volume_ids,
+            )
         owned_instances = record.owned_instance_ids
         owned_volumes = record.owned_volume_ids
         destroy_instances: list[str] = []
         destroy_volumes: list[str] = []
         try:
-            # The independent provider read is the authority for current existence.
+            # The unique attempt label is the recovery key when create succeeded
+            # but the initiating controller died before publishing returned IDs.
             instance_rows = self.provider.list_instances()
-            present_instances = {str(row["id"]) for row in instance_rows}
+            if not isinstance(instance_rows, list):
+                raise ValueError("fake provider returned a malformed instance listing")
+            rows_by_id: dict[str, dict[str, Any]] = {}
+            for row in instance_rows:
+                if not isinstance(row, dict) or not self._valid_instance_id(row.get("id")):
+                    raise ValueError("fake provider returned an instance without a valid ID")
+                iid = str(row["id"])
+                if iid in rows_by_id:
+                    raise ValueError("fake provider returned a duplicate instance ID")
+                rows_by_id[iid] = row
+
+            matching_attempt_ids = {
+                iid for iid, row in rows_by_id.items()
+                if row.get("label") == record.attempt_label and iid not in preexisting_instances
+            }
+            owned_instances = tuple(sorted(set(record.owned_instance_ids) | matching_attempt_ids))
+            if not owned_instances:
+                # A complete listing with no label match is still inconclusive for
+                # an ambiguous create: provider visibility can lag the create call.
+                return self._pending(request_id, operation_fence, alert_id, (), ())
+
+            # Persist the instance ownership before deleting it. If later volume
+            # inventory fails, this record remains the durable discovery anchor.
+            current = self._publish_owned_resources(
+                record,
+                instance_ids=owned_instances,
+                volume_ids=record.owned_volume_ids,
+            )
+            if current is None:
+                return self._pending(
+                    request_id,
+                    operation_fence,
+                    alert_id,
+                    record.owned_instance_ids,
+                    record.owned_volume_ids,
+                )
+            record = current
+            owned_instances = record.owned_instance_ids
+
+            direct_volume_ids: set[str] = set()
+            for iid in owned_instances:
+                row = rows_by_id.get(iid)
+                if row is None:
+                    continue
+                raw_volume_ids = row.get("volume_ids", [])
+                if not isinstance(raw_volume_ids, (list, tuple)):
+                    raise ValueError("fake provider returned malformed direct volume IDs")
+                for raw_id in raw_volume_ids:
+                    volume_id = self._volume_id(raw_id)
+                    if volume_id is None:
+                        raise ValueError("fake provider returned an invalid direct volume ID")
+                    direct_volume_ids.add(volume_id)
+
+            # Complete volume inventory is required before destroying an instance
+            # that may be the only attachment-to-volume discovery anchor.
+            volumes = self.provider.list_volumes()
+            if not isinstance(volumes, list):
+                raise ValueError("fake provider returned a malformed volume listing")
+            volume_rows: dict[str, dict[str, Any]] = {}
+            attachments: dict[str, set[str]] = {}
+            for row in volumes:
+                if not isinstance(row, dict):
+                    raise ValueError("fake provider returned a malformed volume row")
+                volume_id = self._volume_id(row.get("id"))
+                if volume_id is None or volume_id in volume_rows:
+                    raise ValueError("fake provider returned an invalid or duplicate volume ID")
+                raw_attachments = row.get("instances")
+                if not isinstance(raw_attachments, (list, tuple)):
+                    raise ValueError("fake provider returned a malformed volume attachment list")
+                attached_ids: set[str] = set()
+                for attached in raw_attachments:
+                    if not isinstance(attached, dict) or not self._valid_instance_id(attached.get("id")):
+                        raise ValueError("fake provider returned an invalid volume attachment")
+                    attached_ids.add(str(attached["id"]))
+                volume_rows[volume_id] = row
+                attachments[volume_id] = attached_ids
+
+            if not direct_volume_ids.issubset(volume_rows):
+                raise ValueError("directly reported volume is missing from complete provider inventory")
+            owned_instance_set = set(owned_instances)
+            for volume_id in direct_volume_ids:
+                if attachments[volume_id] and not attachments[volume_id].issubset(owned_instance_set):
+                    raise ValueError("direct volume is attached to an unowned instance")
+            attached_volume_ids = {
+                volume_id for volume_id, attached_ids in attachments.items()
+                if attached_ids & owned_instance_set
+            }
+            for volume_id in attached_volume_ids:
+                if not attachments[volume_id].issubset(owned_instance_set):
+                    raise ValueError("attached volume has an unowned attachment")
+            discovered_volumes = (direct_volume_ids | attached_volume_ids) - preexisting_volumes
+
+            current = self._publish_owned_resources(
+                record,
+                instance_ids=owned_instances,
+                volume_ids=tuple(sorted(set(record.owned_volume_ids) | discovered_volumes)),
+            )
+            if current is None:
+                return self._pending(
+                    request_id,
+                    operation_fence,
+                    alert_id,
+                    record.owned_instance_ids,
+                    record.owned_volume_ids,
+                )
+            record = current
+            owned_instances = record.owned_instance_ids
+            owned_volumes = record.owned_volume_ids
+
+            present_instances = set(rows_by_id)
             for iid in owned_instances:
                 if iid in present_instances:
                     self.provider.destroy_instance(iid)
@@ -490,6 +637,68 @@ class FileRecoveryGuardian:
             alert_receipt_id=alert_id,
             hard_deletion_guaranteed=False,
         )
+
+    @staticmethod
+    def _valid_instance_id(value: Any) -> bool:
+        return not isinstance(value, bool) and isinstance(value, (str, int)) and bool(str(value).strip())
+
+    @staticmethod
+    def _volume_id(value: Any) -> str | None:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return None
+        text = str(value)
+        try:
+            parsed = int(text)
+        except ValueError:
+            return None
+        if parsed < 1 or str(parsed) != text:
+            return None
+        return text
+
+    def _publish_owned_resources(
+        self,
+        snapshot: LeaseRegistrySnapshot,
+        *,
+        instance_ids: tuple[str, ...],
+        volume_ids: tuple[str, ...],
+    ) -> LeaseRegistrySnapshot | None:
+        if self.registry is None:
+            return None
+        instances = tuple(sorted(set(snapshot.owned_instance_ids) | set(instance_ids)))
+        volumes = tuple(sorted(set(snapshot.owned_volume_ids) | set(volume_ids)))
+        if (
+            set(instances) & set(snapshot.preexisting_instance_ids)
+            or set(volumes) & set(snapshot.preexisting_volume_ids)
+        ):
+            return None
+        try:
+            published = self.registry.publish_owned_resources(
+                request_id=snapshot.request_id,
+                operation_fence=snapshot.operation_fence,
+                intent_digest=snapshot.intent_digest,
+                instance_ids=instances,
+                volume_ids=volumes,
+            )
+            readback = self.registry.read(snapshot.request_id)
+        except Exception:
+            return None
+        if not (
+            isinstance(readback, LeaseRegistrySnapshot)
+            and readback.durable is True
+            and readback.registry_id == snapshot.registry_id
+            and readback.request_id == snapshot.request_id
+            and readback.operation_fence == snapshot.operation_fence
+            and readback.intent_digest == snapshot.intent_digest
+            and readback.attempt_label == snapshot.attempt_label
+            and readback.preexisting_instance_ids == snapshot.preexisting_instance_ids
+            and readback.preexisting_volume_ids == snapshot.preexisting_volume_ids
+            and set(instances).issubset(readback.owned_instance_ids)
+            and set(volumes).issubset(readback.owned_volume_ids)
+            and not (set(readback.owned_instance_ids) & set(readback.preexisting_instance_ids))
+            and not (set(readback.owned_volume_ids) & set(readback.preexisting_volume_ids))
+        ):
+            return None
+        return readback
 
     def _write_alert(self, request_id: str, fence: int, status: str) -> str:
         receipt_id = f"{self.descriptor.guardian_id}-{uuid.uuid4().hex}"
@@ -956,6 +1165,146 @@ def test_outage_stays_pending_then_recovers_idempotently_after_restore(tmp_path:
         assert final_truth["create_count"] == 1
         assert set(final_truth["instances"]) == {"unrelated-instance"}
         assert set(final_truth["volumes"]) == {"9000"}
+
+
+def _run_to_unpublished_ambiguous_create(
+    harness: FileLeaseLifecycleHarness,
+    request_id: str,
+) -> tuple[FileRecoveryGuardian, FileRecoveryGuardian, LeaseRegistrySnapshot]:
+    first, second = harness.workers()
+    ctl = _direct_controller(harness, (first, second))
+    original_create = ctl.provider.create_instance
+
+    def create_then_lose_response(offer_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        created = original_create(offer_id, params)
+        # The provider accepted create, but the initiating controller cannot list
+        # instances to reconcile before it gives up. The guardian registry has only
+        # CREATE_INTENT and both acknowledgements; no resource IDs were published.
+        harness.provider_control.set_outage(instance_listing=False)
+        raise TimeoutError("fake create response was lost after provider acceptance")
+
+    ctl.provider.create_instance = create_then_lose_response
+    with pytest.raises(LeaseError, match="ambiguous") as error:
+        ctl.run(request_id, _plan(), lambda _: pytest.fail("ambiguous create must not hand out access"))
+    assert error.value.result["state"] == "CREATE_UNCERTAIN"
+
+    snapshot = harness.registry().read(request_id)
+    assert snapshot is not None
+    assert snapshot.state == "CREATE_INTENT"
+    assert snapshot.owned_instance_ids == ()
+    assert snapshot.owned_volume_ids == ()
+    provider_state = harness.provider_truth.read()
+    created = [row for row in provider_state["instances"].values() if row["label"] == snapshot.attempt_label]
+    assert len(created) == 1
+    assert set(snapshot.preexisting_instance_ids) == {"unrelated-instance"}
+    assert set(snapshot.preexisting_volume_ids) == {"9000"}
+    return first, second, snapshot
+
+
+def test_guardian_discovers_unpublished_ambiguous_create_and_cleans_only_request_resources(tmp_path: Path) -> None:
+    harness = FileLeaseLifecycleHarness(tmp_path)
+    first, second, initial_snapshot = _run_to_unpublished_ambiguous_create(
+        harness, "unpublished-create-recovery"
+    )
+    provider_state = harness.provider_truth.read()
+    created = next(
+        row for iid, row in provider_state["instances"].items() if iid not in initial_snapshot.preexisting_instance_ids
+    )
+    created_id = str(created["id"])
+    created_volume_ids = tuple(created["volume_ids"])
+
+    # A pre-existing resource is given the same label to prove that the durable
+    # pre-create ID baseline wins over label matching when excluding ownership.
+    provider_state["instances"]["unrelated-instance"]["label"] = initial_snapshot.attempt_label
+    harness.provider_truth.write(provider_state)
+    harness.provider_control.set_outage(instance_listing=True)
+
+    receipt = first.reconcile(
+        request_id=initial_snapshot.request_id,
+        operation_fence=initial_snapshot.operation_fence,
+    )
+    _assert_recovery_receipt(first, receipt, initial_snapshot.request_id, initial_snapshot.operation_fence)
+    assert receipt.state == RecoveryState.VERIFIED_ABSENT
+    assert receipt.provider_absence_confirmed is True
+    assert receipt.destroy_requests_instance_ids == (created_id,)
+    assert set(receipt.destroy_requests_volume_ids) == set(created_volume_ids)
+
+    published = harness.registry().read(initial_snapshot.request_id)
+    assert published is not None
+    assert published.operation_fence == initial_snapshot.operation_fence
+    assert published.intent_digest == initial_snapshot.intent_digest
+    assert published.attempt_label == initial_snapshot.attempt_label
+    assert published.preexisting_instance_ids == initial_snapshot.preexisting_instance_ids
+    assert published.preexisting_volume_ids == initial_snapshot.preexisting_volume_ids
+    assert published.owned_instance_ids == (created_id,)
+    assert set(published.owned_volume_ids) == set(created_volume_ids)
+
+    truth = harness.provider_truth.read()
+    assert truth["create_count"] == 1
+    assert set(truth["instances"]) == {"unrelated-instance"}
+    assert truth["instances"]["unrelated-instance"]["label"] == initial_snapshot.attempt_label
+    assert set(truth["volumes"]) == {"9000"}
+
+    repeated = second.reconcile(
+        request_id=initial_snapshot.request_id,
+        operation_fence=initial_snapshot.operation_fence,
+    )
+    _assert_recovery_receipt(second, repeated, initial_snapshot.request_id, initial_snapshot.operation_fence)
+    assert repeated.state == RecoveryState.VERIFIED_ABSENT
+    final_truth = harness.provider_truth.read()
+    assert final_truth["create_count"] == 1
+    assert set(final_truth["instances"]) == {"unrelated-instance"}
+    assert set(final_truth["volumes"]) == {"9000"}
+
+
+@pytest.mark.parametrize(
+    ("unavailable_listing", "published_instances_before_restore"),
+    [("instance_listing", ()), ("volume_listing", ("1",))],
+)
+def test_unpublished_create_discovery_listing_failure_stays_pending_then_recovers(
+    tmp_path: Path,
+    unavailable_listing: str,
+    published_instances_before_restore: tuple[str, ...],
+) -> None:
+    harness = FileLeaseLifecycleHarness(tmp_path)
+    first, second, initial_snapshot = _run_to_unpublished_ambiguous_create(
+        harness, f"discovery-failure-{unavailable_listing}"
+    )
+    truth_before = harness.provider_truth.read()
+    created_id = next(
+        iid for iid in truth_before["instances"] if iid not in initial_snapshot.preexisting_instance_ids
+    )
+    created_volume = truth_before["instances"][created_id]["volume_ids"][0]
+
+    if unavailable_listing == "volume_listing":
+        harness.provider_control.set_outage(instance_listing=True, volume_listing=False)
+
+    pending = first.reconcile(
+        request_id=initial_snapshot.request_id,
+        operation_fence=initial_snapshot.operation_fence,
+    )
+    _assert_recovery_receipt(first, pending, initial_snapshot.request_id, initial_snapshot.operation_fence)
+    assert pending.state == RecoveryState.CLEANUP_PENDING
+    assert pending.provider_absence_confirmed is False
+    current = harness.registry().read(initial_snapshot.request_id)
+    assert current is not None
+    assert current.owned_instance_ids == published_instances_before_restore
+    assert current.owned_volume_ids == ()
+    unchanged = harness.provider_truth.read()
+    assert set(unchanged["instances"]) == {"unrelated-instance", created_id}
+    assert set(unchanged["volumes"]) == {"9000", created_volume}
+    assert unchanged["events"] == [["create", created_id]]
+
+    harness.provider_control.set_outage(instance_listing=True, volume_listing=True)
+    recovered = second.reconcile(
+        request_id=initial_snapshot.request_id,
+        operation_fence=initial_snapshot.operation_fence,
+    )
+    _assert_recovery_receipt(second, recovered, initial_snapshot.request_id, initial_snapshot.operation_fence)
+    assert recovered.state == RecoveryState.VERIFIED_ABSENT
+    final = harness.provider_truth.read()
+    assert set(final["instances"]) == {"unrelated-instance"}
+    assert set(final["volumes"]) == {"9000"}
 
 
 def test_file_backed_registry_rejects_stale_fence_and_keeps_resource_publication_monotonic(tmp_path: Path) -> None:

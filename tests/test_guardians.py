@@ -34,6 +34,7 @@ class FakeRegistry:
         self.drop_ack = False
         self.fail_resource_publish = False
         self.mismatch_readback = False
+        self.mismatch_intent_field: str | None = None
 
     def reserve_fence(self, *, request_id, attempt_id, operation_fence):
         from vast_broker.guardians import FenceReservation
@@ -60,8 +61,22 @@ class FakeRegistry:
             intent_digest=intent.digest,
             state="CREATE_INTENT",
             deadline_epoch=intent.deadline_epoch,
+            attempt_label=intent.attempt_label,
+            preexisting_instance_ids=intent.preexisting_instance_ids,
+            preexisting_volume_ids=intent.preexisting_volume_ids,
             durable=True,
         )
+        if self.mismatch_intent_field:
+            self.snapshot = replace(
+                self.snapshot,
+                **{
+                    self.mismatch_intent_field: (
+                        "forged-attempt-label"
+                        if self.mismatch_intent_field == "attempt_label"
+                        else ("unexpected-resource",)
+                    )
+                },
+            )
         return self.snapshot
 
     def read(self, request_id: str) -> LeaseRegistrySnapshot | None:
@@ -190,7 +205,12 @@ def test_arm_requires_durable_intent_and_two_guardian_readbacks_then_publishes_r
     assert ready.operation_fence == 7
     assert ready.intent_digest == intent().digest
     assert ready.physical_separation_proven is False
-    assert {ack.guardian_id for ack in registry.read("request-1").guardian_acks} == {
+    snapshot = registry.read("request-1")
+    assert snapshot is not None
+    assert snapshot.attempt_label == intent().attempt_label
+    assert snapshot.preexisting_instance_ids == intent().preexisting_instance_ids
+    assert snapshot.preexisting_volume_ids == intent().preexisting_volume_ids
+    assert {ack.guardian_id for ack in snapshot.guardian_acks} == {
         "guardian-a", "guardian-b"
     }
 
@@ -318,6 +338,22 @@ def test_shared_record_digest_and_fence_are_checked_on_readback():
 
     with pytest.raises(GuardianReadinessError, match="fence"):
         gate.arm_before_create(intent())
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["attempt_label", "preexisting_instance_ids", "preexisting_volume_ids"],
+)
+def test_shared_intent_readback_requires_exact_discovery_metadata(field):
+    registry = FakeRegistry()
+    registry.mismatch_intent_field = field
+    gate = GuardianReadinessGate(registry, two_guardians(registry), clock=lambda: 100.0)
+
+    with pytest.raises(GuardianReadinessError) as error:
+        gate.arm_before_create(intent())
+
+    assert error.value.reason_code == "registry_intent_mismatch"
+    assert registry.ack_calls == 0
 
 
 def test_stale_fence_is_rejected_before_intent_publication():

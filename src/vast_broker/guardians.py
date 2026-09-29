@@ -135,12 +135,22 @@ class GuardianAck:
 
 @dataclass(frozen=True, slots=True)
 class LeaseRegistrySnapshot:
+    """Durable lease view, including immutable create-discovery metadata.
+
+    Independent guardians need the attempt label and pre-create resource baseline
+    to reconcile an ambiguous provider create without using the initiating host's
+    journal or claiming pre-existing resources.
+    """
+
     registry_id: str
     request_id: str
     operation_fence: int
     intent_digest: str
     state: str
     deadline_epoch: float
+    attempt_label: str
+    preexisting_instance_ids: tuple[str, ...]
+    preexisting_volume_ids: tuple[str, ...]
     durable: bool
     revision: int = 0
     guardian_acks: tuple[GuardianAck, ...] = ()
@@ -194,7 +204,9 @@ class SharedLeaseRegistry(Protocol):
     ``reserve_fence`` must atomically bind this request/attempt to the supplied
     positive monotonic fence. Repeating the same request and attempt is
     idempotent; a stale fence or a fence owned by another attempt is rejected.
-    Resource publication is a monotonic union under the same fence.
+    ``read`` must return the exact durable attempt label and pre-create resource
+    baseline with every later snapshot. Resource publication is a monotonic union
+    under the same fence.
     """
 
     @property
@@ -458,6 +470,15 @@ class GuardianReadinessGate:
             raise GuardianReadinessError("registry_fence_mismatch", "shared registry fence does not match CREATE_INTENT")
         if snapshot.intent_digest != intent.digest or snapshot.deadline_epoch != intent.deadline_epoch:
             raise GuardianReadinessError("registry_intent_mismatch", "shared registry digest or deadline does not match CREATE_INTENT")
+        if (
+            snapshot.attempt_label != intent.attempt_label
+            or snapshot.preexisting_instance_ids != intent.preexisting_instance_ids
+            or snapshot.preexisting_volume_ids != intent.preexisting_volume_ids
+        ):
+            raise GuardianReadinessError(
+                "registry_intent_mismatch",
+                "shared registry attempt label or pre-existing resource baseline does not match CREATE_INTENT",
+            )
         if require_intent_state and snapshot.state != "CREATE_INTENT":
             raise GuardianReadinessError("registry_state_mismatch", "shared registry record is not in CREATE_INTENT")
         if isinstance(snapshot.revision, bool) or not isinstance(snapshot.revision, int) or snapshot.revision < 0:
@@ -470,6 +491,25 @@ class GuardianReadinessGate:
             or any(not isinstance(item, str) or not item for item in (*snapshot.owned_instance_ids, *snapshot.owned_volume_ids))
         ):
             raise GuardianReadinessError("registry_resources_invalid", "shared registry owned resource IDs are malformed")
+        for field_name, values in (
+            ("pre-existing instance IDs", snapshot.preexisting_instance_ids),
+            ("pre-existing volume IDs", snapshot.preexisting_volume_ids),
+        ):
+            if (
+                not isinstance(values, tuple)
+                or any(not isinstance(item, str) or not item for item in values)
+                or len(set(values)) != len(values)
+            ):
+                raise GuardianReadinessError(
+                    "registry_intent_invalid",
+                    f"shared registry {field_name} are malformed",
+                )
+        if not isinstance(snapshot.attempt_label, str) or not snapshot.attempt_label.strip():
+            raise GuardianReadinessError("registry_intent_invalid", "shared registry attempt label is malformed")
+        if set(snapshot.owned_instance_ids) & set(snapshot.preexisting_instance_ids):
+            raise GuardianReadinessError("registry_resources_invalid", "shared registry marks a pre-existing instance as owned")
+        if set(snapshot.owned_volume_ids) & set(snapshot.preexisting_volume_ids):
+            raise GuardianReadinessError("registry_resources_invalid", "shared registry marks a pre-existing volume as owned")
         return snapshot
 
     def _readback(
