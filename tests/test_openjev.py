@@ -10,13 +10,21 @@ import pytest
 from vast_broker.openjev import (
     OPENJEV_COMMIT,
     OPENJEV_MODEL_REVISION,
+    OPENJEV_MIN_COLD_START_SECONDS,
+    LIVE_WINDOW_ATTEMPTS,
+    LIVE_WINDOW_INTERVAL_SECONDS,
+    LIVE_WINDOW_MAX_FAILURES,
+    LIVE_WINDOW_SECONDS,
+    LIVE_WINDOW_IDLE_MARGIN_SECONDS,
     QWEN_BASE_REVISION,
     OpenJevTrialOperation,
     deployment_recipe,
     lease_plan_from_proposal,
     systemone_request,
     trial_steps,
+    trial_limit_floor_errors,
     validate_probe_response,
+    _live_window_script,
     _validate_gpu_preflight,
 )
 
@@ -55,11 +63,13 @@ def test_trial_recipe_is_pinned_deterministic_and_respects_vast_command_limit():
 
     assert [step.name for step in first] == [step.name for step in second]
     assert [step.command for step in first] == [step.command for step in second]
-    assert {"gpu-preflight", "artifact-download", "model-health", "typed-inference"} <= {
-        step.name for step in first
-    }
+    assert {"gpu-preflight", "artifact-download", "model-health", "typed-inference",
+            "live-window-script", "live-window"} <= {step.name for step in first}
     assert all(0 < len(step.command) <= 512 for step in first)
-    assert all("127.0.0.1:8791/v1/systemone" in step.command for step in first if step.probe)
+    assert [step.name for step in first if step.probe] == ["live-window"]
+    assert "127.0.0.1:8791/v1/systemone" in _live_window_script()
+    assert (LIVE_WINDOW_ATTEMPTS - 1) * LIVE_WINDOW_INTERVAL_SECONDS == LIVE_WINDOW_SECONDS
+    assert LIVE_WINDOW_SECONDS >= 180
     health_step = next(step for step in first if step.name == "model-health")
     assert "127.0.0.1:8791/health" in health_step.command
     assert "/openapi.json" not in health_step.command
@@ -89,9 +99,9 @@ def _valid_proposal():
         "temporary_disk_gb": 80,
         "max_hourly_usd": 0.2,
         "max_total_usd": 1.0,
-        "max_runtime_seconds": 1800,
+        "max_runtime_seconds": 5700,
         "start_deadline_seconds": 1800,
-        "cold_start_timeout_seconds": 1200,
+        "cold_start_timeout_seconds": 5400,
         "idle_timeout_seconds": 300,
         "hung_request_timeout_seconds": 300,
         "max_network_usd": 0.05,
@@ -280,7 +290,9 @@ class _FakeExecutor:
                       "method": "lora_decision_head"}
             encoded = base64.b64encode(json.dumps(health).encode()).decode()
             output += f"VBR_HEALTH_BASE64={encoded}\n"
-        if step.probe and exit_code == 0:
+        if step.name in {"typed-inference", "live-window"} and exit_code == 0:
+            if step.name == "live-window":
+                output += f"VBR_LIVE_WINDOW attempts={LIVE_WINDOW_ATTEMPTS} failures=0\n"
             encoded = base64.b64encode(json.dumps(_response()).encode()).decode()
             output += f"VBR_PROBE_BASE64={encoded}\n"
         url = f"https://s3.amazonaws.com/vast-test/result-{index}"
@@ -301,6 +313,70 @@ def test_trial_operation_runs_pinned_steps_and_requires_typed_inference():
     assert result["choice"] == "billing"
     assert result["model_identity"]["code_commit"] == OPENJEV_COMMIT
     assert len(executor.commands) == len(trial_steps())
+    window = result["live_window"]
+    assert window["attempts"] == LIVE_WINDOW_ATTEMPTS
+    assert window["failures"] == 0
+    assert window["max_allowed_failures"] == LIVE_WINDOW_MAX_FAILURES
+    assert window["interval_seconds"] == LIVE_WINDOW_INTERVAL_SECONDS
+    assert window["window_seconds"] == LIVE_WINDOW_SECONDS >= 180
+
+
+def test_trial_operation_marks_activity_after_each_verified_probe():
+    calls: list[int] = []
+    operation = OpenJevTrialOperation(_FakeExecutor())
+    operation.bind_activity(lambda: calls.append(1))
+    result = operation({"id": 123})
+    assert calls == [1, 1]
+    assert result["state"] == "inference_verified"
+
+
+def _tampered_executor(replacement):
+    executor = _FakeExecutor()
+    original = executor.read_instance_command_result
+
+    def patched(result_url, *, max_bytes=1_000_000):
+        return replacement(original(result_url, max_bytes=max_bytes))
+
+    executor.read_instance_command_result = patched
+    return executor
+
+
+@pytest.mark.parametrize("replacement", [
+    lambda out: out.replace("VBR_LIVE_WINDOW", "VBR_WINDOW"),
+    lambda out: out.replace(f"attempts={LIVE_WINDOW_ATTEMPTS}", f"attempts={LIVE_WINDOW_ATTEMPTS - 1}"),
+    lambda out: out.replace("failures=0", "failures=9"),
+])
+def test_trial_operation_fails_closed_when_the_live_window_is_not_proven(replacement):
+    with pytest.raises(RuntimeError, match="live window"):
+        OpenJevTrialOperation(_tampered_executor(replacement))({"id": 123})
+
+
+@pytest.mark.parametrize("field,bad_value", [
+    ("idle_timeout_seconds", 60),
+    ("idle_timeout_seconds", True),
+    ("cold_start_timeout_seconds", 1200),
+    ("max_runtime_seconds", 5000),
+])
+def test_trial_floor_validator_flags_caps_below_pinned_floors(field, bad_value):
+    limits = {"idle_timeout_seconds": LIVE_WINDOW_SECONDS + LIVE_WINDOW_IDLE_MARGIN_SECONDS,
+              "cold_start_timeout_seconds": OPENJEV_MIN_COLD_START_SECONDS,
+              "max_runtime_seconds": OPENJEV_MIN_COLD_START_SECONDS + LIVE_WINDOW_SECONDS
+              + LIVE_WINDOW_INTERVAL_SECONDS}
+    assert trial_limit_floor_errors(limits) == []
+    limits[field] = bad_value
+    assert trial_limit_floor_errors(limits) == [field]
+
+
+def test_lease_plan_rejects_caps_that_would_kill_the_trial():
+    proposal = _valid_proposal()
+    assert lease_plan_from_proposal(proposal)["idle_timeout_seconds"] == 300
+    proposal["limits"]["idle_timeout_seconds"] = 60
+    with pytest.raises(ValueError, match="idle_timeout_seconds"):
+        lease_plan_from_proposal(proposal)
+    proposal = _valid_proposal()
+    proposal["limits"]["cold_start_timeout_seconds"] = 600
+    with pytest.raises(ValueError, match="cold_start_timeout_seconds"):
+        lease_plan_from_proposal(proposal)
 
 
 def test_trial_operation_stops_on_a_failed_setup_step():
@@ -330,6 +406,10 @@ def test_cli_report_requires_the_same_inference_attempt_and_complete_destroy_rec
         "operation_result": {
             "state": "inference_verified", "instance_id": "123",
             "step_receipts": step_receipts, **checked_probe,
+            "live_window": {"attempts": LIVE_WINDOW_ATTEMPTS, "failures": 0,
+                            "max_allowed_failures": LIVE_WINDOW_MAX_FAILURES,
+                            "interval_seconds": LIVE_WINDOW_INTERVAL_SECONDS,
+                            "window_seconds": LIVE_WINDOW_SECONDS},
         },
         "operation_result_sha256": "",
         "confirmed_absent_at_utc": "2026-09-28T00:02:00+00:00",
@@ -372,6 +452,10 @@ def test_cli_report_requires_the_same_inference_attempt_and_complete_destroy_rec
         lambda item: item["operation_result"]["response"].update(model="Qwen/Qwen3.5-2B"),
         lambda item: item["operation_result"]["step_receipts"].update(model_identity="{}"),
         lambda item: item.update(operation_result_sha256="0" * 64),
+        lambda item: item["operation_result"].pop("live_window"),
+        lambda item: item["operation_result"]["live_window"].update(attempts=15),
+        lambda item: item["operation_result"]["live_window"].update(failures=9),
+        lambda item: item["operation_result"]["live_window"].update(window_seconds=168),
     ]
     for mutate in mutations:
         altered = deepcopy(record)

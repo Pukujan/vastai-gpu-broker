@@ -23,6 +23,20 @@ PYTORCH_IMAGE = (
     "pytorch/pytorch@sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be"
 )
 
+# Bounded live-inference window: repeats the pinned typed request across a
+# span of at least three minutes instead of answering a single probe.
+LIVE_WINDOW_ATTEMPTS = 16
+LIVE_WINDOW_INTERVAL_SECONDS = 12
+LIVE_WINDOW_MAX_FAILURES = 2
+LIVE_WINDOW_SECONDS = (LIVE_WINDOW_ATTEMPTS - 1) * LIVE_WINDOW_INTERVAL_SECONDS
+LIVE_WINDOW_IDLE_MARGIN_SECONDS = 120
+# The recipe's install, download, and health-poll steps must finish before the
+# supervisor's cold-start destroy; this floor keeps a proposal from authorizing a
+# window that its own caps would kill.
+OPENJEV_MIN_COLD_START_SECONDS = 5400
+# Setup can legitimately consume the full cold-start budget, so the authorized
+# runtime must also cover that budget plus the live window itself.
+
 _CRITERIA = {
     "billing": "Payment issue",
     "technical": "Setup issue",
@@ -82,6 +96,18 @@ def _run_logged(name: str, body: str, *, log_path: str, probe: bool = False,
     if len(command) > 512:
         raise ValueError(f"pinned {name} command exceeds Vast's 512-character limit")
     return TrialStep(name, command, log_path, probe)
+
+
+def _live_window_script() -> str:
+    """Build the fixed repeat-probe script; no caller text enters the shell."""
+    return (
+        "f=0; for i in $(seq " + str(LIVE_WINDOW_ATTEMPTS) + "); do "
+        "curl -fsS --data-binary @/workspace/openjev-request.json "
+        "http://127.0.0.1:8791/v1/systemone -o /workspace/openjev-response.json"
+        " || f=$((f+1)); sleep " + str(LIVE_WINDOW_INTERVAL_SECONDS) + "; done; "
+        "echo VBR_LIVE_WINDOW attempts=" + str(LIVE_WINDOW_ATTEMPTS)
+        + " failures=$f; [ $f -le " + str(LIVE_WINDOW_MAX_FAILURES) + " ]"
+    )
 
 
 def trial_steps() -> tuple[TrialStep, ...]:
@@ -151,8 +177,14 @@ def trial_steps() -> tuple[TrialStep, ...]:
         _run_logged("model-health", health, log_path="/workspace/vbr-health.log",
                     capture_path="/workspace/openjev-health.json", capture_tag="VBR_HEALTH_BASE64"),
         _run_logged("typed-request", write_request, log_path="/workspace/vbr-request.log"),
-        _run_logged("typed-inference", probe,
-                    log_path="/workspace/vbr-inference.log", probe=True),
+        _run_logged("typed-inference", probe, log_path="/workspace/vbr-inference.log",
+                    capture_path="/workspace/openjev-response.json",
+                    capture_tag="VBR_PROBE_BASE64"),
+        _run_logged("live-window-script",
+                    "printf %s '" + _live_window_script() + "' > /workspace/openjev-live.sh",
+                    log_path="/workspace/vbr-lwscript.log"),
+        _run_logged("live-window", "bash /workspace/openjev-live.sh",
+                    log_path="/workspace/vbr-live.log", probe=True),
     )
     return steps
 
@@ -210,6 +242,38 @@ def deployment_recipe(identity: Mapping[str, Any], disk_gb: int) -> dict[str, An
     return recipe
 
 
+def trial_limit_floor_errors(limits: Mapping[str, Any]) -> list[str]:
+    """Return Open-Jev lifecycle caps that fall below the pinned trial floors.
+
+    The live window needs idle headroom beyond its span, and the recipe's
+    checkout, install, download, and health-poll steps must finish before the
+    supervisor's cold-start destroy, and the runtime must cover the setup budget
+    plus the full live window.
+    """
+    errors: list[str] = []
+    for field, floor in (
+        ("idle_timeout_seconds", LIVE_WINDOW_SECONDS + LIVE_WINDOW_IDLE_MARGIN_SECONDS),
+        ("cold_start_timeout_seconds", OPENJEV_MIN_COLD_START_SECONDS),
+    ):
+        value = limits.get(field)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < floor):
+            errors.append(field)
+    declared_start = limits.get("cold_start_timeout_seconds")
+    if (isinstance(declared_start, (int, float)) and not isinstance(declared_start, bool)
+            and math.isfinite(declared_start)
+            and declared_start > OPENJEV_MIN_COLD_START_SECONDS):
+        setup_budget = declared_start
+    else:
+        setup_budget = OPENJEV_MIN_COLD_START_SECONDS
+    runtime = limits.get("max_runtime_seconds")
+    if (isinstance(runtime, bool) or not isinstance(runtime, (int, float))
+            or not math.isfinite(runtime)
+            or runtime < setup_budget + LIVE_WINDOW_SECONDS):
+        errors.append("max_runtime_seconds")
+    return errors
+
+
 def lease_plan_from_proposal(proposal: Mapping[str, Any]) -> dict[str, Any]:
     """Bind an Open-Jev proposal to the exact controller lease plan."""
     identity = proposal.get("identity")
@@ -228,6 +292,11 @@ def lease_plan_from_proposal(proposal: Mapping[str, Any]) -> dict[str, Any]:
     expected_recipe = deployment_recipe(identity, disk)
     if dict(recipe) != expected_recipe:
         raise ValueError("proposal runtime differs from the pinned Open-Jev trial recipe")
+
+    below_floor = trial_limit_floor_errors(limits)
+    if below_floor:
+        raise ValueError("Open-Jev proposal caps conflict with the pinned trial window: "
+                         + ", ".join(below_floor))
 
     rental_type = offer.get("rental_type")
     if rental_type not in {"ondemand", "bid"} or offer.get("id") is None:
@@ -385,6 +454,11 @@ class OpenJevTrialOperation:
             raise ValueError("trial command deadlines must be finite and positive")
         self.executor, self.clock, self.sleep_fn = executor, clock, sleep_fn
         self.step_timeout_seconds, self.poll_seconds = step_timeout_seconds, poll_seconds
+        self.activity: Callable[[], None] | None = None
+
+    def bind_activity(self, hook: Callable[[], None]) -> None:
+        """Bind a controller hook that marks verified inference work."""
+        self.activity = hook
 
     def __call__(self, instance: Mapping[str, Any]) -> dict[str, Any]:
         instance_id = instance.get("id", instance.get("new_contract"))
@@ -421,18 +495,42 @@ class OpenJevTrialOperation:
                     )
                 except ValueError as exc:
                     raise RuntimeError("Open-Jev server did not load the pinned adapter") from exc
-            if step.probe:
-                encoded = re.search(r"(?:^|\n)VBR_PROBE_BASE64=([A-Za-z0-9+/=]+)(?:\r?\n|$)", output)
-                if not encoded:
-                    raise RuntimeError("Open-Jev inference returned no bounded response payload")
-                try:
-                    decoded = base64.b64decode(encoded.group(1), validate=True)
-                except (ValueError, base64.binascii.Error):
-                    raise RuntimeError("Open-Jev inference response encoding was invalid") from None
-                checked = validate_probe_response(decoded)
+            if step.name == "typed-inference":
+                self._validated_probe_payload(output)
+                if self.activity is not None:
+                    self.activity()
+            if step.name == "live-window":
+                window = self._validate_live_window(output)
+                checked = self._validated_probe_payload(output)
+                if self.activity is not None:
+                    self.activity()
                 return {"state": "inference_verified", "instance_id": str(numeric_id),
-                        "step_receipts": evidence, **checked}
+                        "step_receipts": evidence, **checked, "live_window": window}
         raise RuntimeError("Open-Jev recipe ended without its typed inference step")
+
+    def _validated_probe_payload(self, output: str) -> dict[str, Any]:
+        encoded = re.search(r"(?:^|\n)VBR_PROBE_BASE64=([A-Za-z0-9+/=]+)(?:\r?\n|$)", output)
+        if not encoded:
+            raise RuntimeError("Open-Jev inference returned no bounded response payload")
+        try:
+            decoded = base64.b64decode(encoded.group(1), validate=True)
+        except (ValueError, base64.binascii.Error):
+            raise RuntimeError("Open-Jev inference response encoding was invalid") from None
+        return validate_probe_response(decoded)
+
+    @staticmethod
+    def _validate_live_window(output: str) -> dict[str, Any]:
+        match = re.search(r"VBR_LIVE_WINDOW attempts=(\d+) failures=(\d+)", output)
+        if not match:
+            raise RuntimeError("Open-Jev live window was not proven")
+        attempts = int(match.group(1))
+        failures = int(match.group(2))
+        if attempts != LIVE_WINDOW_ATTEMPTS or failures > LIVE_WINDOW_MAX_FAILURES:
+            raise RuntimeError("Open-Jev live window was not proven")
+        return {"attempts": attempts, "failures": failures,
+                "max_allowed_failures": LIVE_WINDOW_MAX_FAILURES,
+                "interval_seconds": LIVE_WINDOW_INTERVAL_SECONDS,
+                "window_seconds": LIVE_WINDOW_SECONDS}
 
     def _wait_for_result(self, result_url: str) -> str:
         deadline = self.clock() + self.step_timeout_seconds

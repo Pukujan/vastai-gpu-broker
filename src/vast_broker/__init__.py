@@ -18,7 +18,7 @@ from .market import search_offers
 from .provider import VastAPIError, VastOffersClient
 from .openjev import (
     OpenJevTrialOperation, deployment_recipe, lease_plan_from_proposal,
-    systemone_request, trial_steps, validate_health_response, validate_probe_response,
+    systemone_request, trial_limit_floor_errors, trial_steps, validate_health_response, validate_probe_response,
 )
 from .router import authorize_run, candidate_key, review_candidate, route_request
 
@@ -34,6 +34,6 @@ __all__ = [
     "GuardianRecoveryWorker", "WebhookAlertSink", "HTTPRecoveryGuardian",
     "GitHubActionsGuardian", "guardian_gate_from_environment",
     "route_request", "review_candidate", "candidate_key", "authorize_run",
-    "OpenJevTrialOperation", "deployment_recipe", "lease_plan_from_proposal",
+    "OpenJevTrialOperation", "deployment_recipe", "lease_plan_from_proposal", "trial_limit_floor_errors",
     "systemone_request", "trial_steps", "validate_health_response", "validate_probe_response",
 ]
