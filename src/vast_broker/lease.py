@@ -5,6 +5,8 @@ This module never reports a host/network failure as a provider-side deletion gua
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 import os
 import time
 import uuid
@@ -56,6 +58,21 @@ def _instances(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
         raise ValueError("provider instance listing is malformed")
     return value
+
+
+def _instance_inventory_receipt(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fingerprint the IDs from a successfully completed provider inventory."""
+    ids = [_instance_id(row) for row in rows]
+    if any(value is None for value in ids) or len(set(ids)) != len(ids):
+        raise ValueError("provider instance inventory has missing or duplicate IDs")
+    canonical_ids = sorted(ids)
+    return {
+        "complete": True,
+        "instance_count": len(rows),
+        "instance_ids_sha256": hashlib.sha256(
+            json.dumps(canonical_ids, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def _instance_id(instance: Mapping[str, Any]) -> str | None:
@@ -557,6 +574,7 @@ class LeaseController:
         try:
             active_instance = self._await_started(request_id)
             result = operation(dict(active_instance))
+            self._persist_operation_result(request_id, result)
         except BaseException as exc:
             failure = exc
             with self.journal.locked(request_id):
@@ -581,6 +599,35 @@ class LeaseController:
         if out["state"] != "DESTROYED":
             raise LeaseError("lease operation ended with unresolved cleanup", out)
         return out
+
+    def _persist_operation_result(self, request_id: str, result: Any) -> None:
+        """Durably record a bounded JSON result before the cleanup transition."""
+        try:
+            # Canonical key ordering lets the final receipt verifier recompute
+            # this digest after the sorted journal has been written and read.
+            encoded = json.dumps(result, ensure_ascii=False, allow_nan=False,
+                                 separators=(",", ":"), sort_keys=True)
+            if len(encoded.encode("utf-8")) > 1_000_000:
+                raise ValueError("operation result exceeds the durable receipt limit")
+            receipt = json.loads(encoded)
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise LeaseError("operation result could not be durably recorded as bounded JSON") from None
+        with self.journal.locked(request_id):
+            current = self.journal.load(request_id)
+            if (not current or not current.get("owned_instance_ids")
+                    or current.get("state") in {"DESTROY_REQUIRED", "VERIFYING_DESTROY",
+                                                  "CLEANUP_PENDING", "DESTROYED", "FAILED_CLEAN"}):
+                raise LeaseError("lease ended before the operation result could be recorded", current or {})
+            current["operation_result"] = receipt
+            current["operation_result_sha256"] = digest
+            current["operation_completed_epoch"] = self.clock()
+            current["operation_completed_at_utc"] = _utc(current["operation_completed_epoch"])
+            current.setdefault("events", []).append({
+                "at_utc": current["operation_completed_at_utc"],
+                "event": "operation_result_persisted",
+            })
+            self.journal.save(current)
 
     def status(self, request_id: str) -> dict[str, Any] | None:
         with self.journal.locked(request_id):
@@ -700,7 +747,9 @@ class LeaseController:
 
     def _list_required(self) -> list[dict[str, Any]]:
         try:
-            return _instances(self.provider.list_instances())
+            rows = _instances(self.provider.list_instances())
+            _instance_inventory_receipt(rows)
+            return rows
         except Exception as exc:
             raise LeaseError("provider listing is unavailable or malformed; absence is unverified") from exc
 
@@ -920,9 +969,12 @@ class LeaseController:
             try:
                 rows = self._list_required()
                 present_instances = {_instance_id(row) for row in rows}
+                instance_inventory = _instance_inventory_receipt(rows)
                 list_error = None
             except Exception as exc:
+                rows = None
                 present_instances = None
+                instance_inventory = None
                 list_error = type(exc).__name__
             remaining_instances = [iid for iid in ids if present_instances is None or iid in present_instances]
 
@@ -977,6 +1029,8 @@ class LeaseController:
                     "remaining_instance_ids": remaining,
                     "remaining_volume_ids": sorted(set(remaining_volumes) | set(unresolved_present)),
                 }
+                if instance_inventory is not None:
+                    verification["instance_inventory"] = instance_inventory
                 if list_error:
                     verification["instance_list_error_type"] = list_error
                 if volume_listing_error:
@@ -997,6 +1051,14 @@ class LeaseController:
                 ):
                     current["state"] = "DESTROYED"
                     current["confirmed_absent_at_utc"] = _utc(self.clock())
+                    current["absence_evidence"] = {
+                        "checked_at_utc": verification["checked_at_utc"],
+                        "instance_inventory": instance_inventory,
+                        "owned_instance_ids": sorted(all_owned),
+                        "owned_instance_ids_absent": True,
+                        "owned_volume_ids": sorted(set(all_owned_volumes) | set(unresolved_volume_ids)),
+                        "owned_volume_ids_absent": True,
+                    }
                     current.setdefault("events", []).append({"at_utc": _utc(self.clock()), "event": "provider_instance_and_volume_absence_confirmed"})
                     self.journal.save(current)
                     return current

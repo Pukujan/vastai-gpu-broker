@@ -1,6 +1,8 @@
 import pathlib
 import sys
 import unittest
+from urllib.error import HTTPError
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
@@ -69,6 +71,76 @@ class ProviderTests(unittest.TestCase):
             client.create_instance(5, {"image": "fixture", "_broker_rental_type": "reserved"})
         self.assertEqual(calls, [])
 
+    def test_instance_command_uses_documented_route_and_validates_result_url(self):
+        calls = []
+        result_url = "https://s3.amazonaws.com/vast.ai/instance_logs/private-signed-result"
+
+        def transport(method, url, headers, payload):
+            calls.append((method, url, payload))
+            return {"success": True, "result_url": result_url}
+
+        client = VastOffersClient("sentinel", transport=transport)
+        result = client.execute_instance(42, "printf '%s' ready")
+        self.assertEqual(calls, [(
+            "PUT", "https://console.vast.ai/api/v0/instances/command/42",
+            {"command": "printf '%s' ready"},
+        )])
+        self.assertEqual(result, {"success": True, "result_url": result_url})
+
+        for untrusted in (
+            "http://s3.amazonaws.com/log",
+            "https://example.org/log",
+            "https://s3.amazonaws.com.evil.org/log",
+        ):
+            bad = VastOffersClient("sentinel", transport=lambda *_: {"success": True, "result_url": untrusted})
+            with self.assertRaisesRegex(VastAPIError, "result URL was invalid"):
+                bad.execute_instance(42, "printf ready")
+
+        with self.assertRaisesRegex(ValueError, "512 characters"):
+            client.execute_instance(42, "x" * 513)
+
+    def test_instance_result_download_is_bounded_and_never_follows_untrusted_hosts(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, size):
+                assert size == 33
+                return b"typed result"
+
+        client = VastOffersClient("sentinel")
+        opener = Mock()
+        opener.open.return_value = FakeResponse()
+        with patch("vast_broker.provider.build_opener", return_value=opener):
+            result = client.read_instance_command_result(
+                "https://s3.amazonaws.com/vast.ai/log?signature=hidden", max_bytes=32
+            )
+        self.assertEqual(result, "typed result")
+        opener.open.assert_called_once()
+        self.assertNotIn("hidden", repr(result))
+
+        with patch("vast_broker.provider.build_opener") as fetch:
+            with self.assertRaisesRegex(ValueError, "documented HTTPS result host"):
+                client.read_instance_command_result("https://example.org/log")
+        fetch.assert_not_called()
+
+    def test_signed_instance_result_rejects_http_redirects(self):
+        client = VastOffersClient("sentinel")
+        opener = Mock()
+        opener.open.side_effect = HTTPError(
+            "https://s3.amazonaws.com/vast.ai/log?signature=hidden", 302,
+            "redirect", {}, None,
+        )
+        with patch("vast_broker.provider.build_opener", return_value=opener):
+            with self.assertRaisesRegex(VastAPIError, "HTTP 302") as error:
+                client.read_instance_command_result(
+                    "https://s3.amazonaws.com/vast.ai/log?signature=hidden"
+                )
+        self.assertNotIn("hidden", str(error.exception))
+
     def test_destroy_acknowledgement_is_only_a_response_and_list_failure_is_not_empty(self):
         client = VastOffersClient("fake", transport=lambda *_: {"success": True})
         self.assertEqual(client.destroy_instance(9), {"success": True})
@@ -109,6 +181,24 @@ class ProviderTests(unittest.TestCase):
         )
         with self.assertRaises(VastAPIError):
             capped.list_instances(max_pages=1)
+
+    def test_complete_inventory_rejects_missing_non_numeric_and_duplicate_ids(self):
+        malformed_rows = (
+            [{"name": "missing id"}],
+            [{"id": True}],
+            [{"id": "not-an-instance-id"}],
+            [{"id": 11}, {"id": 11}],
+        )
+        for rows in malformed_rows:
+            client = VastOffersClient(
+                "fake",
+                transport=lambda *_, rows=rows: {
+                    "success": True, "total_instances": len(rows), "next_token": None,
+                    "instances": rows,
+                },
+            )
+            with self.subTest(rows=rows), self.assertRaises(VastAPIError):
+                client.list_instances()
 
 
 if __name__ == "__main__":

@@ -11,13 +11,21 @@ import json
 import os
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
+from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 class VastAPIError(RuntimeError):
     """A sanitized API/transport error (never includes request headers)."""
+
+
+class _RejectResultRedirects(HTTPRedirectHandler):
+    """Keep Vast's signed result URL from being forwarded to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class VastOffersClient:
@@ -116,6 +124,7 @@ class VastOffersClient:
             raise ValueError("max_pages must be a positive integer")
         token: str | None = None
         seen_tokens: set[str] = set()
+        seen_instance_ids: set[int] = set()
         rows: list[dict[str, Any]] = []
         expected_total: int | None = None
         for page_index in range(max_pages):
@@ -130,6 +139,15 @@ class VastOffersClient:
             page_rows = response.get("instances")
             if not isinstance(page_rows, list) or any(not isinstance(item, dict) for item in page_rows):
                 raise VastAPIError("instance listing returned an invalid shape")
+            page_ids: list[int] = []
+            for item in page_rows:
+                try:
+                    page_ids.append(_positive_id(item.get("id")))
+                except ValueError:
+                    raise VastAPIError("instance listing returned an invalid instance ID") from None
+            if len(set(page_ids)) != len(page_ids) or seen_instance_ids.intersection(page_ids):
+                raise VastAPIError("instance listing returned duplicate IDs")
+            seen_instance_ids.update(page_ids)
             total = response.get("total_instances")
             if isinstance(total, bool) or not isinstance(total, int) or total < 0:
                 raise VastAPIError("instance listing omitted a valid total count")
@@ -208,6 +226,54 @@ class VastOffersClient:
             f"/instances/bid_price/{_positive_id(instance_id)}",
             {"client_id": "me", "price": str(price)},
         )
+
+    def execute_instance(self, instance_id: int, command: str) -> dict[str, Any]:
+        """Queue one bounded Vast command and return its opaque result URL.
+
+        The caller must use this only inside an already authorized lease. Vast
+        executes the command asynchronously and returns a signed result URL;
+        that URL is never included in raised diagnostics or public logs.
+        """
+        if not isinstance(command, str) or not command.strip() or len(command) > 512 or "\x00" in command:
+            raise ValueError("instance command must be non-empty and at most 512 characters")
+        result = self._request(
+            "PUT", f"/instances/command/{_positive_id(instance_id)}", {"command": command}
+        )
+        if result.get("success") is not True:
+            raise VastAPIError("Vast did not confirm command submission")
+        url = result.get("result_url")
+        parsed = urlparse(url) if isinstance(url, str) else None
+        if (parsed is None or parsed.scheme != "https" or parsed.hostname != "s3.amazonaws.com"
+                or parsed.username or parsed.password or not parsed.path):
+            raise VastAPIError("Vast command result URL was invalid")
+        return {"success": True, "result_url": url}
+
+    def read_instance_command_result(self, result_url: str, *, max_bytes: int = 1_000_000) -> str:
+        """Fetch bounded command output from Vast's documented S3 result host.
+
+        The signed URL is treated as a bearer secret: it is validated locally,
+        never sent to any non-Vast API, and omitted from every error message.
+        """
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 1 <= max_bytes <= 10_000_000:
+            raise ValueError("result byte limit must be between 1 and 10000000")
+        parsed = urlparse(result_url) if isinstance(result_url, str) else None
+        if (parsed is None or parsed.scheme != "https" or parsed.hostname != "s3.amazonaws.com"
+                or parsed.username or parsed.password or not parsed.path):
+            raise ValueError("command result URL must use Vast's documented HTTPS result host")
+        try:
+            opener = build_opener(_RejectResultRedirects)
+            with opener.open(result_url, timeout=self.timeout) as response:
+                payload = response.read(max_bytes + 1)
+        except HTTPError as exc:
+            raise VastAPIError(f"Vast command result HTTP {exc.code}") from None
+        except (URLError, TimeoutError, OSError) as exc:
+            raise VastAPIError(f"Vast command result transport failed ({type(exc).__name__})") from None
+        if len(payload) > max_bytes:
+            raise VastAPIError("Vast command result exceeded the configured byte limit")
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError:
+            raise VastAPIError("Vast command result was not UTF-8") from None
 
 
 def _positive_id(value: Any) -> int:

@@ -154,6 +154,52 @@ class RouterGateTests(unittest.TestCase):
         self.assertTrue(result["paid_action_allowed"])
         self.assertEqual(result["proposal"]["offer"]["verification"], "unverified")
 
+    def test_on_demand_only_strategy_skips_cheaper_bid_without_hiding_it_from_comparison(self):
+        self.request["paid_authorization"] = {
+            "authorized": True, "scope": "exact_artifact",
+            "provenance": {"type": "user_task", "value": "host this exact artifact"},
+        }
+        market = deepcopy(self.market)
+        bid_raw = dict(market["offers"][0]["raw"])
+        bid_raw.update({"id": 31, "type": "bid", "dph_total": 0.05, "min_bid": 0.01})
+        market["offers"].append(normalize_offer(bid_raw, rental_type="bid"))
+
+        result = route_request(
+            self.request, evidence_by_candidate={self.key: self.evidence}, market=market,
+            limits=LIMITS, allowed_rental_types=("ondemand",),
+            now_utc=datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["state"], "READY_TO_RUN")
+        self.assertEqual(result["proposal"]["offer"]["id"], 11)
+        ranking = result["candidate_comparisons"][self.key]["offer_comparison"]["ranking"]
+        self.assertIn(31, [offer["id"] for offer in ranking["eligible"]])
+
+    def test_authorized_rental_types_validation_fails_closed(self):
+        for value in ("bid", (), ("reserved",), (["ondemand"],)):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                route_request(self.request, allowed_rental_types=value)
+
+    def test_no_offer_in_authorized_acquisition_mode_blocks_with_available_modes(self):
+        self.request["paid_authorization"] = {
+            "authorized": True, "scope": "exact_artifact",
+            "provenance": {"type": "user_task", "value": "host this exact artifact"},
+        }
+        market = deepcopy(self.market)
+        bid_raw = dict(market["offers"][0]["raw"])
+        bid_raw.update({"id": 31, "type": "bid", "dph_total": 0.05, "min_bid": 0.01})
+        market["offers"] = [normalize_offer(bid_raw, rental_type="bid")]
+
+        result = route_request(
+            self.request, evidence_by_candidate={self.key: self.evidence}, market=market,
+            limits=LIMITS, allowed_rental_types=("ondemand",),
+            now_utc=datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["state"], "BLOCKED_ACQUISITION_STRATEGY")
+        self.assertEqual(result["available_rental_types"], ["bid"])
+        self.assertFalse(result["paid_action_allowed"])
+
     def test_router_applies_owner_network_ceiling_to_each_direction(self):
         self.request["paid_authorization"] = {"authorized": True, "scope": "exact_artifact",
                                               "provenance": {"type": "user_task", "value": "host this exact artifact"}}
