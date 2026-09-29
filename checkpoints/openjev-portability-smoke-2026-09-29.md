@@ -36,5 +36,5 @@ The last verified broker checkpoint still required two deployed recovery guardia
 - Isolated wheel SHA-256: `8e86c0269a88b403e8a80447209fc5ae8807487e0bf09a839d8cea630cc4eb29`.
 - Task runner: a context-isolated subagent using the temporary workspace; it did not inspect the ACS checkout.
 - Search snapshot: captured `2026-09-29T18:05:50.913203+00:00`; 100 rows, one page, `complete=false`.
-- Branch: `docs/owner-directed-openjev-checkpoint`; the checkpoint and CLI-help fix are pushed for review, not yet merged.
-- Tests: the focused CLI help test passed (1 passed, 7 deselected). The full suite has not been run locally.
+- Merged to `main` via [PR #19](https://github.com/Pukujan/vastai-gpu-broker/pull/19) at commit `6ccd2f8cf4660fe3e819ee88a238314d94875de0`; the required `gates` check passed. The focused CLI help test passed (1 passed, 7 deselected).
+- The full test suite was not run locally.
