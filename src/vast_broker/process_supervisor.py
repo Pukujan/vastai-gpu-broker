@@ -116,6 +116,12 @@ class ProcessLeaseSupervisor:
             time.sleep(self.poll_seconds)
             record = self._journal.load(request_id)
             if not record or record.get("state") in _TERMINAL_STATES:
+                # A healthy worker exits on its own right after finishing its
+                # last attempt; terminating it in that window would clobber the
+                # terminal attempt-state write. Give it a bounded grace first.
+                grace_deadline = time.monotonic() + self.terminate_timeout_seconds
+                while child.poll() is None and time.monotonic() < grace_deadline:
+                    time.sleep(min(0.05, max(0.0, self.poll_seconds)))
                 if child.poll() is None:
                     self._terminate_child(child)
                 self._record_terminal_exit(request_id)
