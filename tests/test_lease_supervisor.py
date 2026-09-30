@@ -394,4 +394,4 @@ def test_terminal_lease_lets_worker_exit_naturally_before_terminating(tmp_path):
     assert record["supervisor_child_status"] == "stopped_terminal"
     assert children[0].terminated is False
     assert children[0].returncode == 0
-    assert "supervisor_child_restart_count" not in record
+    assert len(children) == 1
