@@ -53,9 +53,7 @@ morning SSH instances — but afternoon attempts showed some hosts deny a
 registered key on every probe try while others accept the identical key and
 image immediately. It is a per-host key-injection lottery, not a client bug;
 the mitigation is fast-fail on a denial streak plus cycling hosts.
-and was denied on every probe attempt (up to 25) on others, with the
-identical image, key, and flow — a per-host key-injection lottery, not a
-client bug. Delivering the recipe's step bytes over SSH got further than the
+Delivering the recipe's step bytes over SSH got further than the
 command API ever did. The remaining failures were image defaults:
 `vastai/pytorch:cuda-13.2.1-auto` has git, nvidia-smi and curl but no `python`
 alias, and `vastai/pytorch:cuda-12.8.1-auto` has no `/workspace`, which the
@@ -75,7 +73,9 @@ stood at $0.746 (26 contracts) at 18:55 UTC. The single largest charge,
 $0.267, is one host that stalled and I left past a deadline; every later
 rental closed in minutes. No volume was ever left behind. After each destroy
 the provider's complete listings returned zero instances and zero volumes,
-re-checked twice on the last run. Both registered SSH keys were deleted.
+re-checked twice on the last run. Every SSH key this run registered (two in
+the morning phase, one in the afternoon) was deleted; the account's only
+remaining key is the owner's pre-existing one.
 No key, host, signed URL, raw journal, or account identifier appears in this file
 or the linked comments.
 

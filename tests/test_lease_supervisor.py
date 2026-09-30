@@ -339,3 +339,59 @@ def test_stalled_tick_is_terminated_even_while_heartbeat_is_fresh(tmp_path):
     assert record["supervisor_child_last_error"]["code"] == "worker_attempt_stale"
     assert record["state"] == "DESTROYED"
     assert record["supervisor_child_status"] == "stopped_terminal"
+
+
+def test_terminal_lease_lets_worker_exit_naturally_before_terminating(tmp_path):
+    journal = LeaseJournal(tmp_path / "journal")
+    journal.save({"request_id": "graceful-exit", "state": "READY", "events": []})
+    children = []
+
+    class FakeChild:
+        def __init__(self):
+            self.returncode = None
+            self.terminated = False
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+    def fake_popen(command, **kwargs):
+        child = FakeChild()
+        children.append(child)
+        ready_path = Path(command[command.index("--ready-file") + 1])
+        ready_path.write_text("ready", encoding="utf-8")
+        # The worker finishes its last attempt and exits on its own shortly
+        # after the lease goes terminal. The launcher must observe that exit
+        # instead of SIGTERMing the child mid-write.
+        def delayed_exit():
+            time.sleep(0.3)
+            child.returncode = 0
+        threading.Thread(target=delayed_exit, daemon=True).start()
+        return child
+
+    worker = ProcessLeaseSupervisor(
+        journal.directory,
+        provider_factory="fake:make_provider",
+        poll_seconds=0.01,
+        startup_timeout_seconds=1,
+        terminate_timeout_seconds=2.0,
+        popen=fake_popen,
+    )
+    worker.start("graceful-exit")
+    with journal.locked("graceful-exit"):
+        record = journal.load("graceful-exit")
+        record["state"] = "DESTROYED"
+        journal.save(record)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if journal.load("graceful-exit").get("supervisor_child_status") == "stopped_terminal":
+            break
+        time.sleep(0.01)
+    record = journal.load("graceful-exit")
+    assert record["supervisor_child_status"] == "stopped_terminal"
+    assert children[0].terminated is False
+    assert children[0].returncode == 0
+    assert len(children) == 1
