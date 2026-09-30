@@ -45,10 +45,14 @@ rejected at the door (`image must be a str, not NoneType`). Vast's one
 differently-worded rejection pointed at the fix: "Use ssh to run commands on
 running instances."
 
-SSH works as a transport, with a caveat the afternoon established: auth is
+SSH works as a transport, with one caveat the afternoon established: auth is
 host-specific. Registering an ephemeral account key before create
 (`POST /api/v0/ssh`), reading the endpoint from the instance record's
-`ssh_host`/`ssh_port`, and logging in as root opened first-try on some hosts
+`ssh_host`/`ssh_port`, and logging in as root opened on the first try on both
+morning SSH instances — but afternoon attempts showed some hosts deny a
+registered key on every probe try while others accept the identical key and
+image immediately. It is a per-host key-injection lottery, not a client bug;
+the mitigation is fast-fail on a denial streak plus cycling hosts.
 and was denied on every probe attempt (up to 25) on others, with the
 identical image, key, and flow — a per-host key-injection lottery, not a
 client bug. Delivering the recipe's step bytes over SSH got further than the
