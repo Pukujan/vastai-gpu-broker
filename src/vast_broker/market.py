@@ -6,7 +6,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .provider import VastOffersClient
 
@@ -316,6 +316,46 @@ def _page_rows(response: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+CONSTRAINT_FILTER_KEYS = frozenset({
+    "min_gpu_ram_mb", "min_gpus", "min_cpu_cores", "min_cpu_ram_mb",
+    "min_disk_gb", "min_download_mb_s", "min_upload_mb_s",
+    "min_gpu_memory_bandwidth_gbps", "gpu_name",
+})
+BROKER_ONLY_FILTER_KEYS = frozenset({
+    "require_rentable", "exclude_rented", "rental_types", "verification",
+    "reserved_conversion_authorized", "reserved_commitment",
+})
+
+
+def normalize_search_filters(filters: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the provider query from documented constraint names or raw filters.
+
+    Documented constraint names translate through ``documented_search_filters``.
+    Broker-side availability and cost ceilings never reach the provider query;
+    they are evaluated against returned rows in ``rank_offers``. Any other key
+    passes through byte-identical, so raw Vast operator objects keep working.
+    One field supplied in both the constraint and native forms is a mix error,
+    not a silent override.
+    """
+    constraints: dict[str, Any] = {}
+    query: dict[str, Any] = {}
+    for key, value in filters.items():
+        if key in BROKER_ONLY_FILTER_KEYS or key.endswith("_usd_per_tb_vast_cli_display"):
+            continue
+        if key in CONSTRAINT_FILTER_KEYS and (
+                key != "gpu_name" or isinstance(value, (str, list, tuple, set))):
+            constraints[key] = value
+        else:
+            query[key] = value
+    translated = documented_search_filters(constraints)
+    clash = sorted(set(translated) & set(query))
+    if clash:
+        raise ValueError("filters mix constraint and Vast-native forms for "
+                         + ", ".join(clash))
+    query.update(translated)
+    return query
+
+
 def search_offers(
     filters: dict[str, Any] | None = None,
     *,
@@ -343,6 +383,7 @@ def search_offers(
     reserved = {"type", "limit", "offset", "verified", "verification", "rentable", "rented"}
     if reserved.intersection(filters):
         raise ValueError("filters cannot override type, pagination, or marketplace status fields")
+    filters = normalize_search_filters(filters)
     requested_types = tuple(dict.fromkeys(rental_types))
     if any(kind not in SEARCH_RENTAL_TYPES for kind in requested_types):
         raise ValueError("unsupported rental type")

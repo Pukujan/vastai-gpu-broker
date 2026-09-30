@@ -122,6 +122,53 @@ class MarketOfferTests(unittest.TestCase):
         self.assertEqual(result["offers"][0]["allocated_storage_gb"], 120)
         self.assertTrue(result["completeness"]["complete"])
 
+    def test_documented_constraint_names_are_translated_for_the_provider(self):
+        provider = FakeProvider([{"offers": [row(1, "0.18")]}])
+        result = search_offers(
+            {
+                "gpu_name": ["RTX 5060 Ti"],
+                "min_gpus": 1,
+                "min_gpu_ram_mb": 15000,
+                "require_rentable": True,
+                "exclude_rented": True,
+                "max_upload_usd_per_tb_vast_cli_display": "3",
+                "max_download_usd_per_tb_vast_cli_display": "3",
+            },
+            client=provider,
+            rental_types=("ondemand",),
+        )
+        for payload in provider.payloads:
+            self.assertEqual(payload["gpu_name"], {"eq": "RTX 5060 Ti"})
+            self.assertEqual(payload["num_gpus"], {"gte": 1})
+            self.assertEqual(payload["gpu_ram"], {"gte": 15000})
+            for internal in ("min_gpus", "min_gpu_ram_mb", "require_rentable",
+                             "exclude_rented", "max_upload_usd_per_tb_vast_cli_display",
+                             "max_download_usd_per_tb_vast_cli_display"):
+                self.assertNotIn(internal, payload)
+        self.assertEqual(result["offers"][0]["gpu_name"], "Fixture GPU")
+
+    def test_multiple_gpu_names_use_the_documented_in_operator(self):
+        provider = FakeProvider([{"offers": []}])
+        search_offers({"gpu_name": ["RTX 3090", "RTX 5060 Ti"]}, client=provider,
+                      rental_types=("ondemand",))
+        self.assertEqual(provider.payloads[0]["gpu_name"],
+                         {"in": ["RTX 3090", "RTX 5060 Ti"]})
+
+    def test_native_operator_objects_still_pass_through_byte_identical(self):
+        provider = FakeProvider([{"offers": []}])
+        filters = {"gpu_name": {"eq": "RTX 5060 Ti"}, "num_gpus": {"gte": 1},
+                   "gpu_ram": {"gte": 15000}, "reliability": {"gte": 0.97}}
+        result = search_offers(dict(filters), client=provider, rental_types=("ondemand",))
+        self.assertEqual({k: provider.payloads[0][k] for k in filters}, filters)
+        self.assertEqual(result["query_filters"][0]["reliability"], {"gte": 0.97})
+
+    def test_mixing_constraint_and_native_forms_for_one_field_fails_closed(self):
+        provider = FakeProvider([{"offers": []}])
+        with self.assertRaises(ValueError):
+            search_offers({"min_gpus": 1, "num_gpus": {"gte": 1}},
+                          client=provider, rental_types=("ondemand",))
+        self.assertEqual(provider.payloads, [])
+
     def test_query_filters_capture_explicit_allocation_and_are_sanitized(self):
         fake = FakeProvider([{"offers": [row(1, "0.20")]}])
         result = search_offers(
