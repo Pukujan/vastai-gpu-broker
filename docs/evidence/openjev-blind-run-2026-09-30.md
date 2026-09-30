@@ -1,15 +1,17 @@
-# Eight Open-Jev 9B creates on Vast, all cleaned up, the transport and image gaps pinned down
+# Twenty-eight Open-Jev 9B creates on Vast, all cleaned up, the transport gaps pinned down and the 16 GB fit question decided
 
 On 2026-09-30 an owner-authorized direct run tried to rent GPUs for the pinned
-Open-Jev 9B trial with the remote guardians parked. The morning phase made
-eight create calls and seven instances; afternoon SSH-walk attempts added more
-(26 labeled contracts in total by 18:55 UTC). Every instance was destroyed, and
-every cleanup ended with fresh complete account inventories showing zero
-instances and zero volumes. Session spend is $0.863 against the owner's $2.00
-cap (see Money and cleanup for the timestamped figure). The run pinned down
-two hard facts about Vast's current API: the command endpoint the recipe
-relies on is closed to this account, and Vast's curated images do not carry
-the defaults the pinned recipe assumes.
+Open-Jev 9B trial with the remote guardians parked. Twenty-eight labeled
+contracts were created across the day (a morning eight-create phase plus
+afternoon SSH-walk attempts). Every instance was destroyed, and every cleanup
+ended with fresh complete account inventories showing zero instances and zero
+volumes. Session spend is $1.030 against the owner's $2.00 cap (see Money and
+cleanup for the timestamped figure). The run pinned down three hard facts: the
+command endpoint the recipe relies on is closed to this account; Vast's curated
+images do not carry the defaults the pinned recipe assumes; and the pinned
+BF16 recipe does not fit any Vast RTX 5060 Ti host observed in this session —
+it OOMs at weight placement even with a warm base cache and the allocator
+line enabled.
 [Issue #28](https://github.com/Pukujan/vastai-gpu-broker/issues/28) carries the
 defects; the operator comments on
 [issue #1](https://github.com/Pukujan/vastai-gpu-broker/issues/1) carry the
@@ -43,10 +45,13 @@ rejected at the door (`image must be a str, not NoneType`). Vast's one
 differently-worded rejection pointed at the fix: "Use ssh to run commands on
 running instances."
 
-SSH works as a transport. Registering an ephemeral account key before create
+SSH works as a transport, with a caveat the afternoon established: auth is
+host-specific. Registering an ephemeral account key before create
 (`POST /api/v0/ssh`), reading the endpoint from the instance record's
-`ssh_host`/`ssh_port`, and logging in as root opened on the first try on both
-SSH instances. Delivering the recipe's step bytes over SSH got further than the
+`ssh_host`/`ssh_port`, and logging in as root opened first-try on some hosts
+and was denied on every probe attempt (up to 25) on others, with the
+identical image, key, and flow — a per-host key-injection lottery, not a
+client bug. Delivering the recipe's step bytes over SSH got further than the
 command API ever did. The remaining failures were image defaults:
 `vastai/pytorch:cuda-13.2.1-auto` has git, nvidia-smi and curl but no `python`
 alias, and `vastai/pytorch:cuda-12.8.1-auto` has no `/workspace`, which the
@@ -57,14 +62,16 @@ machines, so pinning a recipe to it means pinning to a moving target.
 
 ## Money and cleanup
 
-Actual machine spend is $0.863 by Vast's `GET /api/v0/charges` (day range
+Actual machine spend is $1.030 by Vast's `GET /api/v0/charges` (day range
 2026-09-28 to 2026-09-30, `select_filters` with unix seconds) across the
-labeled contracts at 18:55 UTC: $0.746 GPU, $0.117 disk, $0.000 bandwidth.
-The morning blind-run phase accounted for about $0.21 of that. The single
-largest charge, $0.267, is one host that stalled and I left past a deadline;
-every later rental closed in minutes. No volume was ever left behind. After
-each destroy the provider's complete listings returned zero instances and zero
-volumes, re-checked twice on the last run. Both registered SSH keys were deleted.
+28 labeled contracts at 20:18 UTC: $0.866 GPU, $0.133 disk, $0.031 bandwidth.
+The figure grew through the day as attempts accumulated: the morning
+blind-run phase (eight creates) accounted for roughly $0.21, and GPU spend
+stood at $0.746 (26 contracts) at 18:55 UTC. The single largest charge,
+$0.267, is one host that stalled and I left past a deadline; every later
+rental closed in minutes. No volume was ever left behind. After each destroy
+the provider's complete listings returned zero instances and zero volumes,
+re-checked twice on the last run. Both registered SSH keys were deleted.
 No key, host, signed URL, raw journal, or account identifier appears in this file
 or the linked comments.
 
@@ -74,8 +81,8 @@ The parts the broker owns worked every time. Live search with the documented
 constraint names (the issue #23 fix on `main`), the all-in cost gate from the
 router's own formula, verification and network-tier filtering, bid and on-demand
 rental, journal-before-create, teardown by owned ids, and absence verification all
-held across every attempt. SSH opened first-try with an account key registered
-before create, and the recipe's bytes ran unchanged over it.
+held across every attempt. SSH carried the recipe's bytes unchanged; its
+first-try success was host-dependent, not flow-dependent (see above).
 
 The deepest run so far carried `gpu-preflight` through `model-start` to
 `VBR_EXIT_CODE=0` with the ~18 GB adapter downloaded, and the server died
@@ -100,16 +107,22 @@ for the full reasoning. What the evidence supports:
   is not a headroom guarantee on Vast hosts, where the driver reserve leaves
   15.48 GiB visible under the 16311 MiB the preflight reports.
 
-Still true and pinned: the broker's own parts worked every time (live search
-with the documented constraint names, the router's all-in cost gate,
-verification and network-tier filtering, journal-before-create, teardown and
-absence proof), the execute API is closed to this account so SSH carries the
-identical step bytes, and the curated image tag is a moving target that must
-provably carry `python` and `/workspace`. A follow-up attempt (on-demand host,
-full-16 GiB preflight floor, warm base preload as a logged deviation, detached
-per-step polling so transport churn cannot fake a step failure) is the active
-test. If the pinned bytes still OOM at placement with the base cached, the
-remaining levers — an accepted 24 GB card, a device_map CPU-offload change, or
-a quantized tier — are owner decisions outside this authorization, and
+The follow-up test then closed the last open hypothesis. On a verified
+on-demand host (16311 MiB preflight, 15854 MiB free at the allocator line,
+`runtime-install` through `model-start` all `VBR_EXIT_CODE=0`, the Qwen base
+preloaded into the default cache to completion before launch, and
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` appended to the env file):
+the server still died at the identical point —
+`torch.OutOfMemoryError: Tried to allocate 96.00 MiB. GPU 0 has a total
+capacity of 15.51 GiB of which 64.00 MiB is free ... 1.14 MiB is reserved but
+unallocated`, inside `transformers` `_materialize_copy` during weight
+placement. With a warm cache and anti-fragmentation both active, the pinned
+BF16 device_map needs roughly 15.5 GiB of a 15.5 GiB-usable card and misses
+the last 96 MiB allocation. Across two different hosts the resident footprint
+reproduced at 15.41-15.42 GiB. The conclusion the earlier retraction asked
+for is now evidence-backed: on Vast 5060 Ti hosts the pinned profile does not
+reach health, and no transport or cache fix changes that. The remaining
+levers — an accepted 24 GB card, a device_map CPU-offload change, or a
+quantized tier — are owner decisions outside this authorization;
 `_validate_gpu_preflight` (openjev.py:549-557) stays unchanged so the trial
 stays the pinned trial.
